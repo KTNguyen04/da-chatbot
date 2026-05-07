@@ -27,7 +27,6 @@ dependencies = [
   "colorama==0.4.6",
   "chromadb>=1.5.9",
   "sentence-transformers>=5.4.1",
-  "kaleido==0.2.1",
 ]
 
 [build-system]
