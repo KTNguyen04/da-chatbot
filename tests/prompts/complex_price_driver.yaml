@@ -1,0 +1,48 @@
+suite: complex_price_driver
+description: Regression prompts for price-driver style questions.
+pass_criteria:
+  - "Có biểu đồ hoặc kế hoạch biểu đồ hợp lệ cho phân tích quan hệ."
+  - "Có insight định lượng (corr/median/mean/chênh lệch theo nhóm)."
+  - "Có kết luận có điều kiện, không khẳng định nhân quả tuyệt đối."
+
+cases:
+  - id: pdrv_01
+    question: "Diện tích và cấu trúc bất động sản ảnh hưởng như thế nào đến giá bán?"
+    expected_signals: ["area", "floors", "bedrooms", "bathrooms", "insight định lượng"]
+
+  - id: pdrv_02
+    question: "Nhà to hơn có luôn đồng nghĩa với đắt hơn không?"
+    expected_signals: ["xu hướng", "ngoại lệ", "kết luận điều kiện"]
+
+  - id: pdrv_03
+    question: "Số tầng, phòng ngủ, phòng tắm có tác động ra sao đến giá?"
+    expected_signals: ["so sánh theo nhóm", "median hoặc mean", "không tuyệt đối"]
+
+  - id: pdrv_04
+    question: "Mặt tiền rộng hơn có làm giá tăng rõ không?"
+    expected_signals: ["frontage", "tương quan hoặc slope", "caveat"]
+
+  - id: pdrv_05
+    question: "Yếu tố nào trong diện tích, phòng ngủ, phòng tắm ảnh hưởng mạnh nhất đến giá?"
+    expected_signals: ["xếp hạng yếu tố", "top driver", "bằng chứng số liệu"]
+
+  - id: pdrv_06
+    question: "Giá theo từng nhóm diện tích có tăng đều không?"
+    expected_signals: ["bins diện tích", "median theo bin", "monotonic check"]
+
+  - id: pdrv_07
+    question: "So sánh giá trung vị theo số phòng ngủ và số tầng."
+    expected_signals: ["group compare", "median", "insight đa nhóm"]
+
+  - id: pdrv_08
+    question: "Có ngoại lệ nào khi nhà diện tích lớn nhưng giá vẫn thấp không?"
+    expected_signals: ["outlier hoặc exception", "cảnh báo dữ liệu"]
+
+  - id: pdrv_09
+    question: "Ảnh hưởng của cấu trúc vật lý đến giá có giống nhau ở mọi nơi không?"
+    expected_signals: ["biến nhiễu", "không nhân quả tuyệt đối", "kết luận thận trọng"]
+
+  - id: pdrv_10
+    question: "Hãy phân tích tổng hợp quan hệ Area/Floors/Bedrooms/Bathrooms với Price."
+    expected_signals: ["tổng hợp đa biến", "biểu đồ + insight", "kết luận có điều kiện"]
+
