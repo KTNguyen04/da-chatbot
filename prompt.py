@@ -17,64 +17,51 @@ from rag_docs_manager import build_rag_context
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-# End-user outputs are Vietnamese; instructions are English for model clarity.
+# All model instructions are in English for clarity.
+# Only end-user–visible output (chart labels, analysis text, result strings) must be Vietnamese.
 VIETNAMESE_USER_FACING_OUTPUT = (
-    "User-visible text (`analysis`, `result`, chart labels/titles/legends, dataframe display) "
-    "must be Vietnamese."
+    "All user-visible text (chart titles, axis labels, legends, `analysis`, `result`) → Vietnamese. "
+    "Variable names and code comments → English."
 )
 
-STRICT_PROMPT_RULES = """
-<strict_rules>
-- Use only columns in <metadata>; no invented numbers, no network/files outside context.
-- Missing column → Vietnamese string in `result` explaining it.
-- Plots: matplotlib/seaborn only; no plt.show(); assign Figure per contract.
-- For price vs drivers/structure: cite chart/table numbers, note exceptions; correlation ≠ causation.
-</strict_rules>
-"""
+STRICT_PROMPT_RULES = """<strict_rules>
+- Use only columns in <metadata>; never invent values or access network/files.
+  Missing column → Vietnamese string in `result` explaining it.
+- matplotlib/seaborn only; NEVER plt.show(); call fig.tight_layout() before result.
+- For price vs. drivers: cite chart numbers, flag outliers, note correlation ≠ causation.
+</strict_rules>"""
 
 
 def _matplotlib_graph_hints() -> str:
-    """Task-agnostic plotting hints; model chooses chart type from question + dtypes."""
-    return """
-<code_ref>
-- `fig, ax = plt.subplots(...)`; `fig.tight_layout()` before `result`.
-- Choose sns/plt by task.
-- PRE-IMPORTED: `import pandas as pd`, `import numpy as np`, `import matplotlib.pyplot as plt`, `import seaborn as sns`, `from matplotlib.figure import Figure`.
-- DATA: `df` and `DF_1` refer to the main dataframe.
-- TITLES/AXES: Vietnamese.
-- RESULTS: `result = {"figure": fig, "analysis": "..."}` or `result = df`.
-</code_ref>
-"""
+    return """<chart_hints>
+fig, ax = plt.subplots(figsize=(...)); fig.tight_layout() before result.
+Pick by dtype+intent: cat-dist→bar(horiz if >8); num-dist→hist/violin;
+2-num→scatter; cat-vs-num→box/violin; part-whole→pie(≤6,+Khác); time→line;
+corr-matrix→heatmap(annot=True,fmt=".2f"); unsupported→nearest+note in analysis.
+Style: x-labels ~45° if crowded; titles/axes/legends Vietnamese; annotate bars if ≤15.
+</chart_hints>"""
 
-SELF_CHECK_INSTRUCTIONS = """
-<self_check>
-Columns exist; values from dataframe; `result` type matches contract; no external I/O.
-</self_check>
-"""
+
+SELF_CHECK_INSTRUCTIONS = """<self_check>
+Verify: columns exist in <metadata>; no hardcoded values; result type matches contract;
+no plt.show(); no file/network I/O.
+</self_check>"""
 
 
 def classify_intent(llm: object, question: str, history: str) -> dict:
-    """
-    LLM routing: intent, soft graph_type hint, analysis tag (codegen picks final chart).
-    """
-    prompt = f"""Return one JSON only. Tabular housing dataset.
-
+    """LLM routing: intent, soft graph_type hint, analysis tag."""
+    prompt = f"""Real-estate data chatbot router. Return ONE JSON only, no extra text.
 Fields:
 - intent: data_analysis | metadata_query | general_chat
 - analysis_intent (if data_analysis): physical_structure_vs_price | bigger_equals_more_expensive | ambiguous | none
-- graph_type: best single label if obvious else "none" — soft hint only; codegen chooses matplotlib details.
-  Labels: scatter_2d_plot, bubble_plot, scatter_3d_plot, bar_plot, line_plot, histogram_plot,
-  pie_plot, box_plot, area_plot, heatmap, violin_plot, density_contour_plot, polar_plot,
-  surface_plot, candle_plot, treemap_plot, sunburst_plot, choroplethmap_plot, densitymap_plot,
-  scattermap_plot, table, none
+- graph_type: soft hint — best label or "none". Labels: scatter_2d_plot, bubble_plot, scatter_3d_plot,
+  bar_plot, line_plot, histogram_plot, pie_plot, box_plot, area_plot, heatmap, violin_plot,
+  density_contour_plot, polar_plot, surface_plot, candle_plot, treemap_plot, sunburst_plot,
+  choroplethmap_plot, densitymap_plot, scattermap_plot, table, none
 - target_col: column name from question or "none"
 
-History:
-{history}
-
-Question:
-{question}
-"""
+History: {history}
+Question: {question}"""
     try:
         import json
         import re
@@ -100,7 +87,7 @@ def define_graph_type(llm: object, question_user: str, hist_questions: str) -> s
 
 
 def process_prompt(
-    session_msgs: list[dict], user_question: str, data: dict, llm: object, intent: str = None, graph_type: str = "none"
+    session_msgs: list[dict], user_question: str, data: dict, llm: object
 ) -> str:
     """
     Build metadata, RAG routing, semantic RAG from rag_docs/, and the final code-generation prompt.
@@ -147,7 +134,7 @@ def process_prompt(
     user_questions = [item for item in session_msgs if item["role"] == "user"]
     questions_text = "\n".join([item["question"] for item in user_questions])
 
-    # intent and graph_type are now passed from app.py to avoid redundant LLM calls
+    graph_type = define_graph_type(llm, user_question, questions_text)
     params_plot = _matplotlib_graph_hints()
 
     try:
@@ -167,48 +154,34 @@ def process_prompt(
         print(f"\n{Fore.LIGHTRED_EX}[RAGDocs] Error: {e}{Fore.RESET}")
 
     if graph_type in [
-        "scatter_2d_plot",
-        "bubble_plot",
-        "scatter_3d_plot",
-        "bar_plot",
-        "line_plot",
-        "histogram_plot",
-        "pie_plot",
-        "box_plot",
-        "area_plot",
-        "choroplethmap_plot",
-        "densitymap_plot",
-        "scattermap_plot",
-        "polar_plot",
-        "surface_plot",
-        "heatmap",
-        "candle_plot",
-        "violin_plot",
-        "density_contour_plot",
-        "sunburst_plot",
-        "treemap_plot",
+        "scatter_2d_plot", "bubble_plot", "scatter_3d_plot", "bar_plot", "line_plot",
+        "histogram_plot", "pie_plot", "box_plot", "area_plot", "choroplethmap_plot",
+        "densitymap_plot", "scattermap_plot", "polar_plot", "surface_plot", "heatmap",
+        "candle_plot", "violin_plot", "density_contour_plot", "sunburst_plot", "treemap_plot",
     ]:
-        result_instruction = """
-# Plot: matplotlib/seaborn; `fig` = Figure; Vietnamese `analysis` citing chart numbers;
-# `result = {"figure": fig, "analysis": analysis}` (not figure alone).
-"""
-        prompt_context = f"""
-        Matplotlib/seaborn; Figure contract above; Vietnamese labels. Pick chart type from
-        <main_question> + dtypes in <metadata>. {params_plot}"""
-    elif graph_type == "table":
-        result_instruction = "# Table: `result` = pandas DataFrame only."
-        prompt_context = "Table/list request → dataframe in `result` only, no plot."
-    else:
-        result_instruction = "# Non-plot: `result` = Vietnamese string."
-        prompt_context = (
-            "Text/numbers only → Vietnamese `result`; skip plotting imports unless a chart helps. "
-            f"If you plot, use dict contract. {params_plot}"
+        result_instruction = (
+            "# result = {'figure': fig, 'analysis': analysis}  ← dict always, never bare Figure\n"
+            "# analysis: Vietnamese, ≤3 sentences, cite ≥1 number from chart."
         )
+        prompt_context = f"Chart intent. {params_plot}\nanalysis: Vietnamese, ≤3 sentences, ≥1 chart number; note correlation ≠ causation if price vs. driver."
+
+    elif graph_type == "table":
+        result_instruction = "# result = <pd.DataFrame>  ← no plot"
+        prompt_context = "Table intent. Filter/aggregate df; assign DataFrame to result. Skip matplotlib unless table + chart explicitly requested."
+
+    else:
+        result_instruction = (
+            "# result = '<Vietnamese answer string>'\n"
+            "# If a chart genuinely helps: result = {'figure': fig, 'analysis': '<Vietnamese>'}"
+        )
+        prompt_context = f"Text/stats intent. Return Vietnamese string in result. Plot only if it materially adds insight; if so use dict contract. {params_plot}"
 
     print(f"\n\n{Fore.LIGHTGREEN_EX}STARTING RUNTIME...{Fore.RESET}")
     print(f"\n{Fore.LIGHTBLUE_EX}GRAPH TYPE BASE:{Fore.RESET} {graph_type}")
 
-    prompt_main = f"""
+    prompt_main = f"""Python data-analysis agent — Vietnamese real-estate dataset.
+Write ONE self-contained python code block answering <main_question>. Executed in sandbox.
+
 <metadata>
 {metadata}
 </metadata>
@@ -219,38 +192,27 @@ def process_prompt(
 {STRICT_PROMPT_RULES}
 {SELF_CHECK_INSTRUCTIONS}
 
-Use DF_* from <metadata>; default primary = DF_1 unless question says otherwise.
-
-# df = DF_1 (already available)
-# No need to import pandas, matplotlib, seaborn, or numpy. They are already in the environment.
+Sandbox vars: DF_1, DF_2, … (default: DF_1). Skeleton:
+```python
+import pandas as pd, matplotlib.pyplot as plt, seaborn as sns
+df = DF_1
+# your code
 {result_instruction}
 result = None
 ```
+<main_question> overrides history/last_code. Round numbers ≤2 decimals.
+On error (<code_error>/<message_error>): rewrite root cause, don't just wrap try/except.
 
-<main_question> is authoritative over history/last_code. Summaries: ≤2 decimals unless int clearer.
-Errors: fix with <code_error>/<message_error>.
-
-<guidelines>
-{prompt_context}
-</guidelines>
-
-<messages_history>
-{questions_text}
-</messages_history>
-
-<main_question>
-{user_question}
-</main_question>
-
+<guidelines>{prompt_context}</guidelines>
+<messages_history>{questions_text}</messages_history>
+<main_question>{user_question}</main_question>
 <last_code>
 ```python
 {context_code}
 ```
 </last_code>
 
-Return the full solution in one fenced python code block.
-
+Return COMPLETE solution in ONE fenced python block. No text outside it.
 {VIETNAMESE_USER_FACING_OUTPUT}
 """
-
     return prompt_main

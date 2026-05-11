@@ -120,18 +120,16 @@ def _rewrite_followup_question_for_analysis(
 
 def should_answer_normally(
     user_question: str, llm: object, messages: list[dict] | None = None
-) -> tuple[bool, str, str, str]:
+) -> tuple[bool, str]:
     """
-    Return (should_short_circuit, response_text, intent, graph_type).
+    Return (should_short_circuit, response_text).
     If should_short_circuit is True, caller should NOT run the Agent/code path.
     """
     q = user_question.strip()
-    intent = "direct_chat"
-    graph_type = "none"
 
     # Follow-up sau dataset overview: ưu tiên đi vào luồng phân tích/chart.
     if _is_dataset_followup_for_analysis(q, messages):
-        return (False, "", "visualization_request", "none")
+        return (False, "")
 
     # Fast-path greetings to reduce latency.
     if _is_greeting(q):
@@ -142,8 +140,6 @@ def should_answer_normally(
             "- Vẽ biểu đồ và phân tích quan hệ giữa các biến\n"
             "- Trả lời các câu hỏi liên quan đến dữ liệu\n\n"
             "Bạn muốn bắt đầu với cột nào hoặc kiểu biểu đồ nào?",
-            "greeting",
-            "none",
         )
 
     dataset_keywords = [
@@ -203,13 +199,11 @@ def should_answer_normally(
             "- Vẽ các biểu đồ (bar/line/scatter/hist/heatmap/mapbox, ...)\n"
             "- Trả lời câu hỏi mô tả theo dữ liệu\n\n"
             "Bạn hãy nói rõ bạn muốn xem biểu đồ gì hoặc bạn quan tâm cột nào nhé.",
-            "greeting",
-            "none",
         )
 
     # Câu hỏi về ý nghĩa cột / ngữ cảnh → ưu tiên RAG trước khi check dataset_keywords
     if _contains_any(q, context_keywords):
-        return (True, "__RAG_CONTEXT__", "context_query", "none")
+        return (True, "__RAG_CONTEXT__")
 
     # High-confidence visualization keywords -> go through the plot flow.
     visualization_keywords = [
@@ -263,10 +257,10 @@ def should_answer_normally(
         "theo loại nhà",
     ]
     if _contains_any(q, visualization_keywords):
-        return (False, "", "visualization_request", "none")
+        return (False, "")
 
     if _contains_any(q, dataset_keywords):
-        return (True, "__DATASET_OVERLAY__", "dataset_info", "none")
+        return (True, "__DATASET_OVERLAY__")
 
     # Numeric / statistical questions → full analysis path (no extra classifier LLM).
     analysis_stats_keywords = [
@@ -313,14 +307,11 @@ def should_answer_normally(
         "frequency",
     ]
     if _contains_any(q, analysis_stats_keywords):
-        return (False, "", "visualization_request", "none")
+        return (False, "")
 
     # Fallback: use LLM classification (handles typos/wording variations).
     try:
-        res = classify_intent_llm(q, llm=llm)
-        intent = res.get("intent", "direct_chat")
-        graph_type = res.get("graph_type", "none")
-
+        intent = classify_intent_llm(q, llm=llm)
         if intent == "greeting":
             return (
                 True,
@@ -329,22 +320,20 @@ def should_answer_normally(
                 "- Vẽ biểu đồ và phân tích quan hệ giữa các biến\n"
                 "- Trả lời các câu hỏi liên quan đến dữ liệu\n\n"
                 "Bạn muốn bắt đầu với cột nào hoặc kiểu biểu đồ nào?",
-                intent,
-                graph_type,
             )
         if intent == "dataset_info":
-            return (True, "__DATASET_OVERLAY__", intent, graph_type)
+            return (True, "__DATASET_OVERLAY__")
         if intent == "context_query":
-            return (True, "__RAG_CONTEXT__", intent, graph_type)
+            return (True, "__RAG_CONTEXT__")
         if intent == "direct_chat":
-            return (True, "__DIRECT_LLM_CHAT__", intent, graph_type)
+            return (True, "__DIRECT_LLM_CHAT__")
         if intent == "visualization_request":
-            return (False, "", intent, graph_type)
+            return (False, "")
     except Exception:
         # Last fallback: treat as direct chat.
-        return (True, "__DIRECT_LLM_CHAT__", "direct_chat", "none")
+        return (True, "__DIRECT_LLM_CHAT__")
 
-    return (True, "__DIRECT_LLM_CHAT__", "direct_chat", "none")
+    return (True, "__DIRECT_LLM_CHAT__")
 
 
 def answer_dataset_overview(df: pd.DataFrame) -> str:
@@ -359,10 +348,15 @@ def answer_dataset_overview(df: pd.DataFrame) -> str:
     )
 
 
-def classify_intent_llm(user_question: str, llm: object) -> dict:
+def classify_intent_llm(user_question: str, llm: object) -> str:
     """
-    Use LLM to classify user intent and graph type.
-    Returns: {"intent": str, "graph_type": str}
+    Use LLM to classify user intent.
+    Output must be one of:
+      - greeting
+      - dataset_info
+      - context_query
+      - visualization_request
+      - direct_chat
     """
     intent_labels = [
         "greeting",
@@ -372,15 +366,16 @@ def classify_intent_llm(user_question: str, llm: object) -> dict:
         "direct_chat",
     ]
 
-    classifier_prompt = f"""Vietnamese data assistant — one JSON: {{"intent": "<label>", "graph_type": "<type>"}}.
-Labels for intent: greeting | dataset_info | context_query | visualization_request | direct_chat
-Labels for graph_type: bar_plot, line_plot, scatter_2d_plot, histogram_plot, table, none
+    classifier_prompt = f"""Intent classifier — Vietnamese real-estate data chatbot.
+Return ONE JSON: {{"intent": "<label>"}}. No extra text.
 
-- greeting: hello only, no data task.
-- dataset_info: list columns/schema/shape, not column meaning.
-- context_query: meaning of a specific field, or dataset story/context.
-- visualization_request: charts/tables OR ranking/compare/top/min/max from data.
-- direct_chat: else.
+greeting           : pure hello, no data task.
+dataset_info       : wants column names / schema / shape — not column meanings.
+context_query      : asks meaning of a SPECIFIC column (e.g. "cột X là gì?"). NOT for analytical questions.
+visualization_request : chart, table, stats, OR analytical hypothesis about data
+                     (e.g. "Liệu nhà to thì giá cao?", "Tỉnh nào đắt nhất?").
+                     Prefer this over context_query when in doubt.
+direct_chat        : everything else.
 
 Message: {user_question}""".strip()
 
@@ -397,11 +392,10 @@ Message: {user_question}""".strip()
         if not m:
             raise ValueError("No JSON found in classifier output.")
         payload = json.loads(m.group(0))
-        if "intent" not in payload:
-             payload["intent"] = "direct_chat"
-        if "graph_type" not in payload:
-             payload["graph_type"] = "none"
-        return payload
+        intent = payload.get("intent")
+        if intent not in intent_labels:
+            raise ValueError(f"Unexpected intent: {intent}")
+        return intent
     finally:
         if prev_temp is not None and hasattr(llm, "temperature"):
             llm.temperature = prev_temp
@@ -612,7 +606,7 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
 
             # If the user message is not asking for visualization/data plots,
             # answer normally to avoid slow "generate+execute code" flow.
-            should_short_circuit, hint_response, intent, graph_type = should_answer_normally(
+            should_short_circuit, hint_response = should_answer_normally(
                 effective_user_question,
                 _get_classifier_llm(llm),
                 st.session_state.messages,
@@ -691,8 +685,7 @@ Question: {effective_user_question}"""
             with st.spinner("Đang phân tích..."):
                 try:
                     prompt = process_prompt(
-                        st.session_state.messages, effective_user_question, data, llm,
-                        intent=intent, graph_type=graph_type
+                        st.session_state.messages, effective_user_question, data, llm
                     )
                     print(
                         f"{Fore.WHITE}  Prompt built ({len(prompt)} chars){Fore.RESET}"
