@@ -21,6 +21,28 @@ from rag_docs_manager import build_rag_context, sync_index
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Prompt guardrails (inspired by good.py strict prompting)
+STRICT_PROMPT_RULES = """
+<strict_rules>
+- KHONG bịa dữ liệu: chỉ dùng cột tồn tại trong <metadata>.
+- KHONG gọi mạng, KHONG đọc file ngoài ngữ cảnh hiện tại.
+- KHONG dùng dữ liệu giả/lấy ví dụ giả để tính kết quả.
+- Neu cột cần thiết không tồn tại, đặt `result` là chuỗi tiếng Việt giải thích thiếu dữ liệu.
+- KHONG dùng `plt`/matplotlib. Với biểu đồ, chỉ dùng Plotly.
+- Ưu tiên comment ngắn gọn bằng tiếng Việt cho các khối logic quan trọng.
+</strict_rules>
+"""
+
+SELF_CHECK_INSTRUCTIONS = """
+<self_check_before_return>
+Trước khi trả lời, tự kiểm tra:
+1) Mọi tên cột đều có trong dữ liệu mẫu.
+2) Mọi phép tính đều dựa trên dataframe thật, không hard-code số liệu.
+3) `result` đúng kiểu theo yêu cầu (figure+analysis / dataframe / string).
+4) Không có code truy cập internet hoặc tài nguyên ngoài bài toán.
+</self_check_before_return>
+"""
+
 
 def classify_intent(llm: object, question: str, history: str) -> dict:
     """
@@ -226,6 +248,7 @@ def process_prompt(
     # ── Process data for prompt <metadata> ────────────────────────────────────
     try:
         output_parts = []
+        context_parts = []
         for index, (name, df) in enumerate(data.items(), start=1):
             buffer = StringIO()
             df.info(buf=buffer)
@@ -233,11 +256,16 @@ def process_prompt(
             df_sample = df.sample(st.session_state["sample_var"]).to_csv(
                 path_or_buf=None, index=False
             )
+            df_context_sample = df.head(2).to_string(index=False)
             df_name = f"DF_{index}"
             output_parts.append(
                 f"\n<{df_name}>\n[INFO {df_name}]:\n{df_info}[SAMPLES {df_name}]:\n{df_sample}</{df_name}>\n"
             )
+            context_parts.append(
+                f"- {df_name}: columns={list(df.columns)}\n  sample:\n{df_context_sample}"
+            )
         metadata = "\n".join(output_parts)
+        data_context = "\n".join(context_parts)
     except Exception as e:
         data = {}
         exception_name = type(e).__name__
@@ -245,6 +273,7 @@ def process_prompt(
         message_ = "WARNING! Sample data error, provided only columns as samples"
         st.error(f"{message_}  <{exception_name}: {track_line}>")
         metadata = str(df.columns)
+        data_context = f"columns_only={metadata}"
 
     # ── Code in context ────────────────────────────────────────────────────────
     if st.session_state["context_code_var"]:
@@ -366,16 +395,17 @@ def process_prompt(
         # Hiển thị text count trên từng bar.
 """
 
-        prompt_context = f"""
-        {province_hint}
-        {"""
+        price_driver_hint = ""
+        intent_hint = ""
+        if is_price_driver_question:
+            price_driver_hint = """
         # PRICE DRIVER HINT:
         # Câu hỏi này yêu cầu phân tích mức độ ảnh hưởng của diện tích/cấu trúc đến giá.
         # Bắt buộc nêu bằng chứng định lượng, ngoại lệ và kết luận có điều kiện.
         # Không khẳng định quan hệ nhân quả tuyệt đối, phải ghi rõ 'tương quan không đồng nghĩa nhân quả'.
         # Ưu tiên scatter (Area-Price) + so sánh nhóm theo Floors/Bedrooms/Bathrooms/Frontage.
-        """ if is_price_driver_question else ""}
-        {"""
+"""
+            intent_hint = """
         # INTENT RECOGNITION:
         # Map câu hỏi theo nghĩa ngữ nghĩa về 2 intent:
         # (1) Physical Structure vs. Price
@@ -390,7 +420,12 @@ def process_prompt(
         #   + Box plot theo nhóm diện tích để kiểm tra vùng chồng lấn giá giữa nhà nhỏ/lớn.
         #   + Scatter 2D để chỉ ra các ngoại lệ (nhà nhỏ đắt hơn nhà lớn).
         # Không dùng 1 biểu đồ duy nhất để kết luận tuyệt đối khi có ngoại lệ.
-        """ if is_price_driver_question else ""}
+"""
+
+        prompt_context = f"""
+        {province_hint}
+        {price_driver_hint}
+        {intent_hint}
         For plots, ONLY use the "Plotly" library and bring fig object into the result variable.
         The template should ONLY be "plotly", when not requested.
         All texts in titles, axis titles, legends, hovers, etc., SET to language "{lang_for_text}".
@@ -440,7 +475,12 @@ def process_prompt(
         <metadata>
         {metadata}
         </metadata>
+        <data_context>
+        {data_context}
+        </data_context>
         {rag_docs_context}
+        {STRICT_PROMPT_RULES}
+        {SELF_CHECK_INSTRUCTIONS}
         
         DEFINE DF_* according to the <main_question> using the variables already declared <DF_1, DF_2, DF_*, ...>. 
         A priori assumes DF as DF_1.
@@ -448,6 +488,8 @@ def process_prompt(
         ```python
         # TODO: import the necessary dependencies.
         import pandas as pd 
+        import plotly.express as px
+        import plotly.graph_objects as go
         ...
             
         df = pd.DataFrame(DF_*)
