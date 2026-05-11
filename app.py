@@ -22,6 +22,12 @@ from langchain_openai import ChatOpenAI
 from langchain_community.chat_models import ChatOllama
 from tool_executor import run_tool_insight
 from rag_docs_manager import build_rag_context
+from conversation_log_storage import (
+    iter_archive_messages,
+    list_archives,
+    load_conversation,
+    save_conversation,
+)
 
 
 # Parameters
@@ -441,6 +447,13 @@ def clear_chat_history() -> None:
     Clear chat history | reset session variables | stop runtime agent.
     """
 
+    # Snapshot current conversation before clearing.
+    try:
+        save_conversation(st.session_state.get("messages", []))
+    except Exception:
+        # Never block the clear action if saving fails.
+        pass
+
     # Reset session_state vars
     st.session_state["last_code"] = ""
     st.session_state["context_code_var"] = False
@@ -452,6 +465,34 @@ def clear_chat_history() -> None:
     if agent is not None:
         agent.chat_stop()
         del agent
+
+
+def render_archived_conversation(archive: dict) -> None:
+    """
+    Render a saved conversation in read-only mode.
+    """
+    for msg in iter_archive_messages(archive):
+        role = msg.get("role", "assistant")
+        msg_type = msg.get("type", "text")
+        content = msg.get("content", "")
+
+        with st.chat_message(role):
+            if msg_type == "chart":
+                s = str(content)
+                if s.startswith("data:image/png;base64,"):
+                    import base64
+
+                    b64 = s.split(",", 1)[1]
+                    st.image(base64.b64decode(b64))
+                else:
+                    # Fallback: plotly-json stored as string
+                    try:
+                        fig_json = json.loads(s)
+                        st.plotly_chart(go.Figure(fig_json))
+                    except Exception:
+                        st.write("[Không thể render lại biểu đồ đã lưu]")
+            else:
+                st.markdown(str(content))
 
 
 def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
@@ -947,10 +988,33 @@ def main() -> None:
         st.session_state["lang_var"] = "vi"
         st.session_state["sample_var"] = N_SAMPLES
 
-        # Button to delete chat history
+        # Conversation archive history (read-only)
+        if "archive_filename" not in st.session_state:
+            st.session_state["archive_filename"] = None
+
+        archives = list_archives()
+        archive_options = ["(Live chat)"] + [a.filename for a in archives]
+        current = st.session_state.get("archive_filename")
+        index = 0
+        if current and current in archive_options:
+            index = archive_options.index(current)
+        selected = st.selectbox(
+            "🕘 Lịch sử hội thoại",
+            archive_options,
+            index=index,
+        )
+
+        if selected == "(Live chat)":
+            st.session_state["archive_filename"] = None
+        else:
+            st.session_state["archive_filename"] = selected
+
+        # Button to delete chat history (auto-saves first)
         side_container_2 = st.sidebar.container(border=True)
         side_container_2.button(
-            "🗑️ &nbsp;&nbsp;Xóa hội thoại", on_click=clear_chat_history
+            "🗑️ &nbsp;&nbsp;Xóa hội thoại",
+            on_click=clear_chat_history,
+            disabled=st.session_state.get("archive_filename") is not None,
         )
 
         # Temperature only (hardcoded dataset + Ollama model).
@@ -966,7 +1030,18 @@ def main() -> None:
         base_url=OLLAMA_BASE_URL,
     )
     agent = get_llm_agent(data, llm)
-    process_chat(agent, llm, data)
+
+    archive_filename = st.session_state.get("archive_filename")
+    if archive_filename:
+        try:
+            archive = load_conversation(archive_filename)
+        except Exception:
+            archive = {"messages": [{"role": "assistant", "type": "text", "content": "Không thể mở hội thoại đã lưu."}]}
+        render_archived_conversation(archive)
+        # Read-only mode: do not allow new messages.
+        st.info("Đang xem hội thoại đã lưu (read-only).")
+    else:
+        process_chat(agent, llm, data)
 
 
 if __name__ == "__main__":
