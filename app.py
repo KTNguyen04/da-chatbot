@@ -4,15 +4,26 @@ from pathlib import Path
 import json
 import re
 import traceback
-import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objs as go
 
 from colorama import Fore
 from agent import AgentAI
-from prompt import process_prompt
+from prompt import build_json_intent_prompt
 from styles import process_styles
+
+from chart_pipeline import (
+    PLOTLY_RENDER_CONFIG,
+    eval_table_query,
+    extract_json_object,
+    new_chart_message_id,
+    normalize_intent_payload,
+    optimize_plotly_figure,
+    store_in_exec_cache,
+    take_from_exec_cache,
+    _stable_code_fingerprint,
+)
 
 from langchain_community.chat_models import ChatOllama
 from tool_executor import run_tool_insight
@@ -549,6 +560,125 @@ def clear_chat_history() -> None:
     st.session_state["agent_var"] = None
 
 
+def _execute_pending_chart_msg(msg_id: str) -> None:
+    """Deferred Plotly execution (chatbot.py-style); reuses session exec cache."""
+    df = st.session_state.get("_chart_main_df")
+    agent: AgentAI | None = st.session_state.get("agent_var")
+    code_key = f"chart_code_{msg_id}"
+    code = (st.session_state.get(code_key) or "").strip()
+
+    target: dict | None = None
+    for m in st.session_state.messages:
+        r = m.get("response")
+        if isinstance(r, dict) and r.get("chart_pipeline") and r.get("msg_id") == msg_id:
+            target = r
+            break
+
+    if target is None or df is None or agent is None:
+        return
+
+    if not code:
+        target["state"] = "error"
+        target["error"] = "Chưa có mã Python để thực thi."
+        return
+
+    target.pop("error", None)
+    target["state"] = "pending"
+    target.pop("figure", None)
+    target.pop("post_chart_analysis", None)
+
+    fp = _stable_code_fingerprint(code, df)
+    cached = take_from_exec_cache(fp)
+    if cached is not None:
+        fig = cached["figure"]
+        exec_analysis = cached.get("analysis")
+    else:
+        try:
+            agent.last_code = code
+            result = agent.run_code(code)
+        except Exception as e:
+            target["state"] = "error"
+            target["error"] = f"{type(e).__name__}: {e}"
+            return
+        if not isinstance(result, dict) or result.get("figure") is None:
+            target["state"] = "error"
+            target["error"] = (
+                "Code chạy xong nhưng không trả về `result` dict có key 'figure'. "
+                "Hãy gán `result = {'figure': fig, 'analysis': '...'}`."
+            )
+            return
+        raw_fig = result["figure"]
+        exec_analysis = result.get("analysis")
+        fig = optimize_plotly_figure(raw_fig)
+        store_in_exec_cache(fp, fig, exec_analysis)
+
+    target["state"] = "ready"
+    target["figure"] = fig
+    target["post_chart_analysis"] = (exec_analysis or "").strip()
+    st.session_state["last_code"] = code
+
+    uq = target.get("_user_question", "")
+    if ENABLE_TOOL_INSIGHT and uq:
+        try:
+            tool_insight_text = run_tool_insight(
+                user_question=uq,
+                df=df,
+                ollama_base_url=OLLAMA_BASE_URL,
+                model=OLLAMA_MODEL,
+                verbose=VERBOSE,
+            )
+        except Exception:
+            tool_insight_text = None
+        if tool_insight_text:
+            sep = "\n\n---\n" if target.get("post_chart_analysis") else ""
+            target["post_chart_analysis"] = (
+                (target.get("post_chart_analysis") or "")
+                + sep
+                + "**🔧 Phân tích từ Tool Insight:**\n\n"
+                + tool_insight_text
+            ).strip()
+
+
+def _render_chart_pipeline_message(message: dict, main_df: pd.DataFrame) -> None:
+    """Render one assistant message produced by the JSON chart pipeline."""
+    r = message["response"]
+    if r.get("idea"):
+        st.info(f"💡 **Ý tưởng:** {r['idea']}")
+    if r.get("explanation"):
+        st.markdown(r["explanation"])
+
+    state = r.get("state", "pending")
+    if state == "error":
+        st.error(r.get("error", "Lỗi không xác định"))
+    if state == "ready" and r.get("figure") is not None:
+        st.plotly_chart(r["figure"], config=PLOTLY_RENDER_CONFIG)
+        if r.get("post_chart_analysis"):
+            st.markdown(r["post_chart_analysis"])
+        return
+
+    rid = r.get("msg_id")
+    if not rid:
+        return
+    code_key = f"chart_code_{rid}"
+    if code_key not in st.session_state:
+        st.session_state[code_key] = r.get("code", "") or ""
+
+    st.markdown("**📝 Mã Plotly (chỉnh sửa nếu cần, rồi bấm thực thi):**")
+    st.text_area(
+        "chart_code_editor",
+        height=240,
+        key=code_key,
+        label_visibility="collapsed",
+    )
+    st.button(
+        "✅ Thực thi biểu đồ",
+        key=f"chart_exec_btn_{rid}",
+        on_click=_execute_pending_chart_msg,
+        args=(rid,),
+        type="primary",
+    )
+
+
 def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
     """
     This function creates and processes the chat engine.
@@ -566,45 +696,55 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    main_df = _get_main_df(data)
+    st.session_state["_chart_main_df"] = main_df
+
     # Show messages from chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             if "question" in message:
                 st.markdown(message["question"])
             elif "response" in message:
-                if isinstance(message["response"], str):
-                    st.write(message["response"])
-                elif isinstance(message["response"], go.Figure):
-                    config = {"displaylogo": False}
-                    st.plotly_chart(message["response"], config=config)
-                elif (
-                    isinstance(message["response"], dict)
-                    and "figure" in message["response"]
+                resp = message["response"]
+                if isinstance(resp, str):
+                    st.write(resp)
+                elif isinstance(resp, go.Figure):
+                    st.plotly_chart(resp, config=PLOTLY_RENDER_CONFIG)
+                elif isinstance(resp, dict) and resp.get("chart_pipeline"):
+                    _render_chart_pipeline_message(message, main_df)
+                elif isinstance(resp, dict) and "table" in resp and isinstance(
+                    resp["table"], pd.DataFrame
                 ):
-                    # Dict từ plot agent: {"figure": go.Figure, "analysis": str}
-                    config = {"displaylogo": False}
-                    st.plotly_chart(message["response"]["figure"], config=config)
-                    analysis_text = message["response"].get("analysis", "")
+                    if resp.get("caption"):
+                        st.markdown(resp["caption"])
+                    st.dataframe(resp["table"])
+                elif isinstance(resp, dict) and "figure" in resp:
+                    st.plotly_chart(resp["figure"], config=PLOTLY_RENDER_CONFIG)
+                    analysis_text = resp.get("analysis", "")
                     if analysis_text:
                         st.markdown(analysis_text)
-                elif isinstance(message["response"], list) or isinstance(
-                    message["response"], tuple
-                ):
-                    for i in range(len(message["response"])):
-                        if isinstance(message["response"][i], go.Figure):
-                            config = {"displaylogo": False}
-                            st.plotly_chart(message["response"][i], config=config)
+                elif isinstance(resp, list) or isinstance(resp, tuple):
+                    for i in range(len(resp)):
+                        if isinstance(resp[i], go.Figure):
+                            st.plotly_chart(resp[i], config=PLOTLY_RENDER_CONFIG)
                         else:
-                            st.write(message["response"][i])
-                elif isinstance(message["response"], dict):
-                    for key_, value_ in message["response"].items():
-                        if isinstance(message["response"][key_], go.Figure):
-                            config = {"displaylogo": False}
-                            st.plotly_chart(message["response"][key_], config=config)
+                            st.write(resp[i])
+                elif isinstance(resp, dict):
+                    for key_, value_ in resp.items():
+                        if key_ in ("chart_pipeline", "table", "msg_id"):
+                            continue
+                        if isinstance(value_, go.Figure):
+                            st.plotly_chart(value_, config=PLOTLY_RENDER_CONFIG)
+                        elif isinstance(value_, dict) and "figure" in value_:
+                            st.plotly_chart(
+                                value_["figure"], config=PLOTLY_RENDER_CONFIG
+                            )
+                            if value_.get("analysis"):
+                                st.markdown(value_["analysis"])
                         else:
-                            st.write(message["response"][key_])
+                            st.write(value_)
                 else:
-                    st.write(message["response"])
+                    st.write(resp)
             elif "error" in message:
                 st.text(message["error"])
 
@@ -727,214 +867,169 @@ User message: {effective_user_question}
                 print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
                 st.rerun()
 
-            # ── BƯỚC 2: Build prompt + Agent chat ────────────────────────────
-            print(f"\n{Fore.CYAN}[STEP 2] BUILD PROMPT & AGENT CHAT{Fore.RESET}")
-            with st.spinner("Đang phân tích..."):
+            # ── BƯỚC 2: JSON intent (chatbot.py-style) — một vòng LLM, không Agent.retry ──
+            print(f"\n{Fore.CYAN}[STEP 2] JSON INTENT PROMPT (single LLM){Fore.RESET}")
+            st.session_state["_chart_main_df"] = _get_main_df(data)
+
+            prompt = build_json_intent_prompt(
+                st.session_state.messages, effective_user_question, data, llm
+            )
+            print(f"{Fore.WHITE}  Prompt built ({len(prompt)} chars){Fore.RESET}")
+
+            raw_text = ""
+            with st.spinner("Đang phân tích (sinh JSON)..."):
                 try:
-                    prompt = process_prompt(
-                        st.session_state.messages, effective_user_question, data, llm
-                    )
-                    print(
-                        f"{Fore.WHITE}  Prompt built ({len(prompt)} chars){Fore.RESET}"
-                    )
-                    print(
-                        f"{Fore.CYAN}[STEP 3] LLM INVOKE + CODE EXECUTION{Fore.RESET}"
-                    )
-                    response = llm_agent.chat(prompt)
-                    print(
-                        f"{Fore.GREEN}  ✓ Agent response type: {type(response).__name__}{Fore.RESET}"
+                    resp_obj = llm.invoke(prompt)
+                    raw_text = (
+                        resp_obj.content
+                        if hasattr(resp_obj, "content")
+                        else str(resp_obj)
                     )
                 except Exception as e:
-                    exception_name = type(e).__name__
-                    track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
-                    response = f"EXCEPTION ERROR: {exception_name}: {track_line}"
-                    print(
-                        f"{Fore.RED}  ✗ Agent FAILED: {exception_name} {track_line}{Fore.RESET}"
+                    print(f"{Fore.RED}  ✗ LLM invoke FAILED: {e}{Fore.RESET}")
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "response": "Mình không gọi được model lúc này. Bạn thử lại sau nhé.",
+                        }
                     )
-                    # raise sys.exc_info()[0]
+                    st.session_state["last_code"] = ""
+                    print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
+                    st.rerun()
 
-                st.session_state["last_code"] = llm_agent.get_last_code()
-                # Code in context
-                st.session_state["context_code_var"] = True
-
-                # Convert output with numbers (int and float) to string
-                response = (
-                    str(response)
-                    if isinstance(response, int) or isinstance(response, float)
-                    else response
+            parsed = extract_json_object(raw_text)
+            if not parsed:
+                repair_prompt = (
+                    prompt
+                    + "\n\nLần trước bạn không trả về JSON hợp lệ. "
+                    "Trả về DUY NHẤT một JSON object đúng schema, không markdown, không giải thích ngoài JSON."
                 )
-                # Convert nd.array output to string
-                response = (
-                    str(response.item())
-                    if isinstance(response, np.ndarray)
-                    else response
-                )
-
-                # ── BƯỚC 4: Xử lý kiểu kết quả trả về ───────────────────────
-                print(f"\n{Fore.CYAN}[STEP 4] XỬ LÝ KẾT QUẢ AGENT{Fore.RESET}")
-                print(
-                    f"{Fore.LIGHTYELLOW_EX}CODE RESPONSE:{Fore.RESET}", type(response)
-                )
-                if isinstance(response, dict):
-                    print(
-                        f"{Fore.WHITE}  response keys: {list(response.keys())}{Fore.RESET}"
-                    )
-                elif isinstance(response, str):
-                    preview = response[:80].replace("\n", " ")
-                    print(f"{Fore.WHITE}  response preview: {preview!r}{Fore.RESET}")
-
-                # ── Tool-Calling Insight ─────────────────────────────────────
-                # Sau khi có figure/response, gọi LLM với tool-calling để tính
-                # số liệu thực từ DataFrame rồi sinh insight câu hỏi người dùng.
-                fig_for_insight: go.Figure | None = None
-                agent_analysis: str | None = None
-
-                if ENABLE_TOOL_INSIGHT:
-                    if isinstance(response, dict):
-                        fig_for_insight = response.get("figure")
-                        agent_analysis = response.get("analysis")
-                    elif isinstance(response, go.Figure):
-                        fig_for_insight = response
-
-                tool_insight_text: str | None = None
-                # Single tool-insight pass per request (after agent) — avoids duplicate Ollama rounds.
-                if ENABLE_TOOL_INSIGHT and (
-                    fig_for_insight is not None or isinstance(response, str)
-                ):
-                    print(f"\n{Fore.CYAN}[STEP 5] TOOL-CALLING INSIGHT{Fore.RESET}")
-                    print(
-                        f"{Fore.WHITE}  has_figure={fig_for_insight is not None} | is_str={isinstance(response, str)}{Fore.RESET}"
-                    )
-                    main_df = _get_main_df(data)
-                    with st.spinner("🔧 Đang gọi tool phân tích số liệu..."):
-                        tool_insight_text = run_tool_insight(
-                            user_question=effective_user_question,
-                            df=main_df,
-                            ollama_base_url=OLLAMA_BASE_URL,
-                            model=OLLAMA_MODEL,
-                            verbose=VERBOSE,
-                        )
-                    if tool_insight_text:
-                        preview = tool_insight_text[:100].replace("\n", " ")
-                        print(
-                            f"{Fore.GREEN}  ✓ Tool insight OK ({len(tool_insight_text)} chars): {preview!r}{Fore.RESET}"
-                        )
-                    else:
-                        print(f"{Fore.YELLOW}  ⚠ Tool insight trống{Fore.RESET}")
-                else:
-                    print(
-                        f"\n{Fore.CYAN}[STEP 5] TOOL-CALLING INSIGHT — bỏ qua{Fore.RESET}"
-                    )
-                    print(
-                        f"{Fore.YELLOW}  ENABLE={ENABLE_TOOL_INSIGHT} | figure={fig_for_insight is not None} | str={isinstance(response, str)}{Fore.RESET}"
-                    )
-                # ─────────────────────────────────────────────────────────────
-
-                # ── BƯỚC 6: Lưu session ───────────────────────────────────────
-                print(f"\n{Fore.CYAN}[STEP 6] LƯU SESSION & RERUN{Fore.RESET}")
                 try:
-                    if isinstance(response, str):
-                        # Handles exceptions
-                        if response.split()[0] == "EXCEPTION":
-                            print(
-                                f"{Fore.RED}  ✗ EXCEPTION trong response → hiển thị thông báo lỗi{Fore.RESET}"
-                            )
-                            st.session_state["response_error_var"] = response
-                            if tool_insight_text:
-                                response = (
-                                    "Mình gặp lỗi khi dựng biểu đồ tự động, nhưng vẫn rút được kết luận từ tools:\n\n"
-                                    f"**🔧 Phân tích từ Tool Insight:**\n\n{tool_insight_text}"
-                                )
-                            else:
-                                response = (
-                                    "Xin lỗi, mình không thể đáp ứng yêu cầu của bạn. "
-                                    "Bạn hãy xóa lịch sử hội thoại và thử lại nhé."
-                                )
-                            # Hide last code
-                            st.session_state["last_code"] = None
-                            _stream_text(response)
-                        else:
-                            if tool_insight_text:
-                                # Stream base response first, then stream tool insight
-                                _stream_text(response)
-                                st.markdown("\n\n---")
-                                st.markdown("**🔧 Phân tích từ Tool Insight:**\n")
-                                _stream_text(tool_insight_text)
-                                response = (
-                                    f"{response}\n\n---\n"
-                                    f"**🔧 Phân tích từ Tool Insight:**\n\n"
-                                    f"{tool_insight_text}"
-                                )
-                            else:
-                                _stream_text(response)
-                            print(f"{Fore.GREEN}  ✓ Lưu response dạng str{Fore.RESET}")
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": response}
-                        )
-
-                    elif isinstance(response, dict) and "figure" in response:
-                        # Chuẩn hoá response dict: giữ figure + ghép insight
-                        combined_insight = ""
-                        if agent_analysis:
-                            combined_insight += agent_analysis
-                        if tool_insight_text:
-                            separator = "\n\n---\n" if combined_insight else ""
-                            combined_insight += (
-                                f"{separator}**🔧 Phân tích từ Tool Insight:**\n\n"
-                                f"{tool_insight_text}"
-                            )
-                        if combined_insight:
-                            response["analysis"] = combined_insight
-                        # Display figure immediately, then stream analysis
-                        config = {"displaylogo": False}
-                        st.plotly_chart(response["figure"], config=config)
-                        if combined_insight:
-                            _stream_text(combined_insight)
-                        print(
-                            f"{Fore.GREEN}  ✓ Lưu response dạng dict+figure | has_analysis={bool(combined_insight)}{Fore.RESET}"
-                        )
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": response}
-                        )
-                    elif isinstance(response, go.Figure):
-                        payload = {"figure": response}
-                        if tool_insight_text:
-                            payload["analysis"] = (
-                                "**🔧 Phân tích từ Tool Insight:**\n\n"
-                                f"{tool_insight_text}"
-                            )
-                        # Display figure immediately, then stream analysis
-                        config = {"displaylogo": False}
-                        st.plotly_chart(response, config=config)
-                        if tool_insight_text:
-                            st.markdown("**🔧 Phân tích từ Tool Insight:**\n")
-                            _stream_text(tool_insight_text)
-                        print(
-                            f"{Fore.GREEN}  ✓ Lưu response dạng figure | has_analysis={bool(tool_insight_text)}{Fore.RESET}"
-                        )
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": payload}
-                        )
-
-                    else:
-                        print(
-                            f"{Fore.GREEN}  ✓ Lưu response dạng {type(response).__name__}{Fore.RESET}"
-                        )
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": response}
-                        )
-                except Exception as e:
-                    exception_name = type(e).__name__
-                    track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
-                    message_ = "Lỗi khi hiển thị kết quả:"
-                    print(
-                        f"{Fore.RED}  ✗ Lỗi lưu session: {exception_name} {track_line}{Fore.RESET}"
+                    resp2 = llm.invoke(repair_prompt)
+                    raw2 = (
+                        resp2.content
+                        if hasattr(resp2, "content")
+                        else str(resp2)
                     )
-                    st.error(f"{message_}  <{exception_name}: {track_line}>")
-                    # raise sys.exc_info()[0]
+                    parsed = extract_json_object(raw2)
+                except Exception:
+                    parsed = None
 
+            if not parsed:
+                print(f"{Fore.RED}  ✗ JSON parse FAILED{Fore.RESET}")
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "response": (
+                            "Mình không đọc được phản hồi có cấu trúc từ model. "
+                            "Bạn thử hỏi lại hoặc diễn đạt rõ hơn nhé."
+                        ),
+                    }
+                )
+                st.session_state["last_code"] = ""
                 print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
                 st.rerun()
+
+            payload = normalize_intent_payload(parsed)
+            intent = payload["intent"]
+            st.session_state["last_code"] = payload["code"] or ""
+            st.session_state["context_code_var"] = True
+            print(f"\n{Fore.CYAN}[STEP 3] INTENT={intent}{Fore.RESET}")
+
+            if intent == "TEXT":
+                tool_insight_text: str | None = None
+                response_text = payload.get("explanation", "").strip() or (
+                    payload.get("idea", "").strip()
+                    or "Mình chưa có nội dung trả lời từ model."
+                )
+                if ENABLE_TOOL_INSIGHT:
+                    print(f"\n{Fore.CYAN}[STEP 4] TOOL INSIGHT (TEXT){Fore.RESET}")
+                    with st.spinner("🔧 Đang gọi tool phân tích số liệu..."):
+                        try:
+                            tool_insight_text = run_tool_insight(
+                                user_question=effective_user_question,
+                                df=_get_main_df(data),
+                                ollama_base_url=OLLAMA_BASE_URL,
+                                model=OLLAMA_MODEL,
+                                verbose=VERBOSE,
+                            )
+                        except Exception as e:
+                            print(f"{Fore.YELLOW}  ⚠ tool insight: {e}{Fore.RESET}")
+                            tool_insight_text = None
+                    if tool_insight_text:
+                        response_text = (
+                            f"{response_text}\n\n---\n"
+                            f"**🔧 Phân tích từ Tool Insight:**\n\n{tool_insight_text}"
+                        )
+                _stream_text(response_text)
+                st.session_state.messages.append(
+                    {"role": "assistant", "response": response_text}
+                )
+
+            elif intent == "TABLE":
+                tq = (payload.get("table_query") or "").strip()
+                if not tq:
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "response": "Model trả về TABLE nhưng thiếu `table_query`. Bạn thử lại nhé.",
+                        }
+                    )
+                else:
+                    try:
+                        df_by_name = {
+                            f"DF_{i + 1}": dfi for i, dfi in enumerate(data.values())
+                        }
+                        result_df = eval_table_query(tq, df_by_name)
+                        cap = (payload.get("explanation") or "").strip()
+                        st.session_state.messages.append(
+                            {
+                                "role": "assistant",
+                                "response": {"table": result_df, "caption": cap},
+                            }
+                        )
+                    except Exception as e:
+                        st.session_state.messages.append(
+                            {
+                                "role": "assistant",
+                                "response": f"Lỗi khi tạo bảng: {type(e).__name__}: {e}",
+                            }
+                        )
+
+            elif intent == "CHART":
+                rid = new_chart_message_id()
+                code = (payload.get("code") or "").strip()
+                st.session_state[f"chart_code_{rid}"] = code
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "response": {
+                            "chart_pipeline": True,
+                            "state": "pending",
+                            "msg_id": rid,
+                            "idea": payload.get("idea", ""),
+                            "explanation": payload.get("explanation", ""),
+                            "code": code,
+                            "_user_question": effective_user_question,
+                        },
+                    }
+                )
+                print(
+                    f"{Fore.GREEN}  ✓ Pending chart message | msg_id={rid}{Fore.RESET}"
+                )
+
+            else:
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "response": payload.get("explanation", "")
+                        or "Không xử lý được intent.",
+                    }
+                )
+
+            print(f"\n{Fore.CYAN}[STEP 5] LƯU SESSION & RERUN{Fore.RESET}")
+            print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
+            st.rerun()
 
 
 def get_llm_agent(data: dict, llm: object) -> AgentAI:

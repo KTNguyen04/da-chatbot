@@ -643,3 +643,190 @@ def process_prompt(
         """
 
     return prompt_main
+
+
+def _compute_metadata_blocks(data: dict) -> tuple[str, str]:
+    """Build <metadata> and compact data_context strings (expensive: df.info + sample)."""
+    last_df = None
+    output_parts: list[str] = []
+    context_parts: list[str] = []
+    try:
+        for index, (name, df) in enumerate(data.items(), start=1):
+            last_df = df
+            buffer = StringIO()
+            df.info(buf=buffer)
+            df_info = buffer.getvalue()
+            df_sample = df.sample(st.session_state["sample_var"]).to_csv(
+                path_or_buf=None, index=False
+            )
+            df_context_sample = df.head(2).to_string(index=False)
+            df_name = f"DF_{index}"
+            output_parts.append(
+                f"\n<{df_name}>\n[INFO {df_name}]:\n{df_info}[SAMPLES {df_name}]:\n{df_sample}</{df_name}>\n"
+            )
+            context_parts.append(
+                f"- {df_name}: columns={list(df.columns)}\n  sample:\n{df_context_sample}"
+            )
+        return "\n".join(output_parts), "\n".join(context_parts)
+    except Exception as e:
+        exception_name = type(e).__name__
+        track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
+        message_ = "WARNING! Sample data error, provided only columns as samples"
+        st.error(f"{message_}  <{exception_name}: {track_line}>")
+        cols = list(last_df.columns) if last_df is not None else []
+        meta = str(cols)
+        return meta, f"columns_only={meta}"
+
+
+def get_cached_metadata_and_context(data: dict) -> tuple[str, str]:
+    """
+    Cache df.info + sample CSV across Streamlit reruns when the dataframe identity
+    and sample size are unchanged (same pattern as chatbot.py: avoid repeated work).
+    """
+    n = int(st.session_state.get("sample_var", 5))
+    identity = "|".join(
+        f"{name}:{df.shape}:{tuple(df.columns)}:{tuple(str(t) for t in df.dtypes)}"
+        for name, df in data.items()
+    )
+    cache = st.session_state.setdefault("_json_prompt_meta_cache", {})
+    key = (identity, n)
+    if key in cache:
+        return cache[key]
+    meta, ctx = _compute_metadata_blocks(data)
+    cache[key] = (meta, ctx)
+    return meta, ctx
+
+
+def build_json_intent_prompt(
+    session_msgs: list[dict], user_question: str, data: dict, llm: object
+) -> str:
+    """
+    Single LLM call: respond with one JSON object (CHART / TABLE / TEXT), chatbot.py-style.
+    Reuses graph routing, ragdata code_ref, and semantic RAG from rag_docs/.
+    """
+    metadata, data_context = get_cached_metadata_and_context(data)
+
+    if st.session_state.get("context_code_var"):
+        st.session_state["context_code_var"] = False
+        context_code = st.session_state.get("last_code") or ""
+    else:
+        context_code = "No code returned for context."
+
+    user_questions = [item for item in session_msgs if item["role"] == "user"]
+    questions_text = "\n".join([item["question"] for item in user_questions])
+
+    graph_type = define_graph_type(llm, user_question, questions_text)
+    params_plot = _load_ragdata_code_ref(graph_type)
+
+    try:
+        rag_docs_context = build_rag_context(
+            user_question, top_k=3, min_similarity=0.25
+        )
+        if rag_docs_context:
+            print(
+                f"\n{Fore.LIGHTMAGENTA_EX}[RAGDocs] JSON intent prompt — context injected{Fore.RESET}"
+            )
+        else:
+            print(
+                f"\n{Fore.LIGHTBLACK_EX}[RAGDocs] JSON intent prompt — no docs above threshold{Fore.RESET}"
+            )
+    except Exception as e:
+        rag_docs_context = ""
+        print(f"\n{Fore.LIGHTRED_EX}[RAGDocs] Error: {e}{Fore.RESET}")
+
+    price_driver_keywords = [
+        "ảnh hưởng",
+        "tác động",
+        "liệu",
+        "có luôn",
+        "nhà to hơn",
+        "diện tích",
+        "phòng ngủ",
+        "phòng tắm",
+        "số tầng",
+        "mặt tiền",
+    ]
+    q_lower = user_question.lower()
+    is_price_driver_question = any(kw in q_lower for kw in price_driver_keywords) and (
+        "giá" in q_lower or "price" in q_lower
+    )
+
+    routing_note = f'Router gợi ý chart: "{graph_type}" (chỉ là gợi ý; bạn chọn intent đúng nhất).'
+
+    intent_contracts = """
+Khi intent là CHART:
+- Trường "code" chứa TOÀN BỘ mã Python thực thi được trong sandbox (Plotly only, không plt).
+- Code phải dùng các biến DF_1, DF_2, ... đã có sẵn; có thể `df = DF_1.copy()` nếu cần.
+- Biến GEOJSON (list) đã có sẵn như trong pipeline cũ.
+- Cuối code BẮT BUỘC gán: `result = {"figure": fig, "analysis": analysis}` với `fig` là plotly.graph_objects.Figure hoặc plotly express,
+  và `analysis` là chuỗi tiếng Việt ngắn (insight từ số liệu thật trên chart).
+- Không gọi fig.show().
+
+Khi intent là TABLE:
+- "table_query" là một biểu thức Python duy nhất trả về pandas.DataFrame, chỉ dùng DF_1, DF_2, ... và `pd`.
+  Ví dụ: `DF_1[DF_1["Province"] == "Hà Nội"].head(20)`
+- "code" để trống.
+
+Khi intent là TEXT:
+- "explanation" trả lời đầy đủ bằng tiếng Việt.
+- "code" và "table_query" để trống.
+"""
+
+    price_driver_block = ""
+    if is_price_driver_question:
+        price_driver_block = """
+Câu hỏi kiểu "yếu tố ảnh hưởng giá": trong "explanation" (và "analysis" nếu CHART) phải có bằng chứng định lượng,
+ít nhất một ngoại lệ, và kết luận có điều kiện; nhắc tương quan không phải nhân quả (tiếng Việt).
+"""
+
+    code_ref_block = f"\n<code_ref_graph>\n{params_plot}\n</code_ref_graph>\n"
+
+    json_shape = """
+Trả về DUY NHẤT một JSON object (không bọc trong markdown fence), đúng schema:
+{
+  "intent": "CHART" | "TABLE" | "TEXT",
+  "idea": "1-2 câu tiếng Việt về hướng xử lý",
+  "explanation": "Giải thích / trả lời cho người dùng (tiếng Việt)",
+  "code": "...(chuỗi Python, hoặc rỗng)...",
+  "table_query": "...(chuỗi biểu thức, hoặc rỗng)..."
+}
+"""
+
+    prompt_main = f"""
+Bạn là AI phân tích dữ liệu bất động sản Việt Nam.
+
+{routing_note}
+{json_shape}
+
+{intent_contracts}
+
+{STRICT_PROMPT_RULES}
+{SELF_CHECK_INSTRUCTIONS}
+{VIETNAMESE_USER_FACING_OUTPUT}
+
+<metadata>
+{metadata}
+</metadata>
+<data_context>
+{data_context}
+</data_context>
+{rag_docs_context}
+{code_ref_block}
+{price_driver_block}
+
+<history>
+{questions_text}
+</history>
+
+<last_code>
+```python
+{context_code}
+```
+</last_code>
+
+<user_question>
+{user_question}
+</user_question>
+"""
+    print(f"\n{Fore.LIGHTGREEN_EX}[JSON intent prompt]{Fore.RESET} graph_type={graph_type}")
+    return prompt_main.strip()

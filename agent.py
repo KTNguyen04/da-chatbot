@@ -214,6 +214,14 @@ class AgentAI:
         """
         return self.last_prompt
 
+    def run_code(
+        self, code: str
+    ) -> Union[list, str, pd.DataFrame, go.Figure, dict, None]:
+        """
+        Execute LLM-generated code once (no LLM round-trip). Used by the JSON chart pipeline.
+        """
+        return self.exec_code(code)
+
     @abstractmethod
     def restricted_import(self, name, globals=None, locals=None, fromlist=(), level=0):
         """
