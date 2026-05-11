@@ -1,12 +1,12 @@
 import base64
+import io
 import json
 import os
 from datetime import datetime
 import re
 
 import numpy as np
-import plotly.graph_objs as go
-import plotly.io as pio
+from matplotlib.figure import Figure
 
 LOG_DIR = "./conversation_logs"
 
@@ -52,30 +52,24 @@ def _extract_code_block(content: str) -> str | None:
     return match.group(1).strip()
 
 
-def _figure_to_b64_png(figure: go.Figure) -> str | None:
+def _figure_to_b64_png(figure: Figure) -> str | None:
+    """Render matplotlib Figure to base64-encoded PNG string."""
     try:
-        png_bytes = pio.to_image(figure, format="png")
-    except Exception:
-        return None
-    return base64.b64encode(png_bytes).decode("utf-8")
-
-
-def _figure_to_json_safe(figure: go.Figure) -> object:
-    """Convert a Plotly figure to a JSON-serializable dict, stripping numpy types."""
-    try:
-        raw = figure.to_plotly_json()
-        # Round-trip through _NumpyEncoder to sanitize all numpy values.
-        return json.loads(json.dumps(raw, cls=_NumpyEncoder))
+        buf = io.BytesIO()
+        figure.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("utf-8")
     except Exception:
         return None
 
 
-def _extract_figure(payload: object) -> go.Figure | None:
-    if isinstance(payload, go.Figure):
+def _extract_figure(payload: object) -> Figure | None:
+    """Extract matplotlib Figure from a raw response or a {'figure': Fig} dict."""
+    if isinstance(payload, Figure):
         return payload
     if isinstance(payload, dict):
         figure = payload.get("figure")
-        if isinstance(figure, go.Figure):
+        if isinstance(figure, Figure):
             return figure
     return None
 
@@ -88,7 +82,6 @@ def _serialize_message(message: dict) -> dict:
         "content": content,
         "type": "text",
         "chart_image_b64": None,
-        "chart_figure_json": None,
         "code": None,
     }
 
@@ -96,17 +89,18 @@ def _serialize_message(message: dict) -> dict:
     if role == "assistant" and figure is not None:
         serialized["type"] = "chart_image"
         serialized["chart_image_b64"] = _figure_to_b64_png(figure)
-        serialized["chart_figure_json"] = _figure_to_json_safe(figure)  # ← fixed
         analysis = ""
         if isinstance(payload, dict):
             analysis = str(payload.get("analysis", "")).strip()
         serialized["content"] = analysis
+
     if role == "assistant":
         explicit_code = str(message.get("code", "")).strip()
         if explicit_code:
             serialized["code"] = explicit_code
         elif _is_code_message(content):
             serialized["code"] = _extract_code_block(content)
+
     if role == "assistant" and serialized["code"] and serialized["type"] == "text":
         serialized["type"] = "code"
 
@@ -142,7 +136,7 @@ def save_conversation(messages: list[dict], latest_code: str | None = None) -> s
         "messages": [_serialize_message(message) for message in prepared_messages],
     }
     with open(filepath, "w", encoding="utf-8") as file_obj:
-        json.dump(payload, file_obj, ensure_ascii=False, indent=2, cls=_NumpyEncoder)  # ← fixed
+        json.dump(payload, file_obj, ensure_ascii=False, indent=2, cls=_NumpyEncoder)
     return filepath
 
 

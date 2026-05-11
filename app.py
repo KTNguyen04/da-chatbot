@@ -13,12 +13,11 @@ from colorama import Fore
 from agent import AgentAI
 from prompt import process_prompt
 from styles import process_styles
-import conversation_logger
 
 from langchain_community.chat_models import ChatOllama
 from tool_executor import run_tool_insight
 from rag_docs_manager import build_rag_context, warmup_rag_embedder
-
+from conversation_logger import list_conversations, load_conversation, save_conversation
 
 # Parameters
 WHITELIST_ENV = ["json", "statsmodels", "scipy", "datetime"]
@@ -495,14 +494,18 @@ if "agent_var" not in st.session_state:
 
 def clear_chat_history() -> None:
     """
-    Clear chat history | reset session variables | stop runtime agent.
+    Lưu hội thoại hiện tại vào log trước khi xóa, sau đó reset session.
     """
+    messages = st.session_state.get("messages", [])
+    latest_code = st.session_state.get("last_code") or None
 
-    # Save current chat before clearing.
-    conversation_logger.save_conversation(
-        st.session_state.get("messages", []),
-        st.session_state.get("last_code"),
-    )
+    # Chỉ lưu nếu có ít nhất 1 tin nhắn
+    if messages:
+        saved_path = save_conversation(messages, latest_code)
+        if saved_path:
+            print(f"{Fore.LIGHTGREEN_EX}[Archive] Đã lưu hội thoại → {saved_path}{Fore.RESET}")
+        else:
+            print(f"{Fore.YELLOW}[Archive] Không lưu được hội thoại{Fore.RESET}")
 
     # Reset session_state vars
     st.session_state["last_code"] = ""
@@ -517,6 +520,55 @@ def clear_chat_history() -> None:
     st.session_state["agent_var"] = None
 
 
+def _render_archived_message(message: dict) -> None:
+    """Render một message đã lưu trong log (view-only, không cần st.rerun)."""
+    role = message.get("role", "assistant")
+    msg_type = message.get("type", "text")
+    content = message.get("content", "")
+    code = message.get("code")
+
+    with st.chat_message(role):
+        if role == "user":
+            st.markdown(content)
+            return
+
+        # assistant
+        if msg_type == "chart_image":
+            b64 = message.get("chart_image_b64")
+            if b64:
+                import base64
+                png_bytes = base64.b64decode(b64)
+                st.image(png_bytes)
+            if content:
+                st.markdown(content)
+        elif msg_type == "code":
+            if content:
+                st.markdown(content)
+        else:
+            if content:
+                st.markdown(content)
+
+        # Hiện code expander cho mọi loại message assistant nếu có code
+        if code:
+            with st.expander("Python code"):
+                st.code(code, language="python")
+ 
+ 
+def _render_archive_view(filepath: str) -> None:
+    """Load và render toàn bộ 1 file log dưới dạng view-only."""
+    try:
+        log = load_conversation(filepath)
+    except Exception as e:
+        st.error(f"Không thể đọc log: {e}")
+        return
+ 
+    saved_at = log.get("saved_at", "")
+    st.caption(f"📁 Lưu lúc: {saved_at}  •  Chỉ xem, không thể chat")
+    st.divider()
+ 
+    for message in log.get("messages", []):
+        _render_archived_message(message)
+
 def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
     """
     This function creates and processes the chat engine.
@@ -527,50 +579,12 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
         data: dictionary of dataframes
     """
 
+    with st.chat_message("assistant"):
+        st.write("Chào bạn! Mình sẵn sàng giúp bạn khám phá dữ liệu. Bắt đầu thôi?")
+
     # Initialize chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
-
-    if st.session_state.get("viewing_log"):
-        viewing_path = st.session_state["viewing_log"]
-        log_name = os.path.basename(viewing_path)
-        st.info(
-            f"📂 Viewing archived conversation — {log_name}. Chat is disabled."
-        )
-        try:
-            archived_payload = conversation_logger.load_conversation(viewing_path)
-            for message in archived_payload.get("messages", []):
-                with st.chat_message(message.get("role", "assistant")):
-                    msg_type = message.get("type", "text")
-                    msg_content = message.get("content", "")
-                    if msg_type == "code":
-                        code_content = message.get("code") or msg_content
-                        st.code(code_content, language="python")
-                    elif msg_type == "chart_image":
-                        chart_b64 = message.get("chart_image_b64")
-                        if chart_b64:
-                            st.image(base64.b64decode(chart_b64))
-                        else:
-                            chart_json = message.get("chart_figure_json")
-                            if chart_json:
-                                config = {"displaylogo": False}
-                                st.plotly_chart(go.Figure(chart_json), config=config)
-                        if msg_content:
-                            st.markdown(msg_content)
-                        msg_code = message.get("code")
-                        if msg_code:
-                            st.code(msg_code, language="python")
-                    else:
-                        st.markdown(msg_content)
-                        msg_code = message.get("code")
-                        if msg_code:
-                            st.code(msg_code, language="python")
-        except Exception as exc:
-            st.error(f"Không thể mở hội thoại đã lưu: {exc}")
-        return
-
-    with st.chat_message("assistant"):
-        st.write("Chào bạn! Mình sẵn sàng giúp bạn khám phá dữ liệu. Bắt đầu thôi?")
 
     # Show messages from chat history
     for message in st.session_state.messages:
@@ -832,7 +846,6 @@ Question: {effective_user_question}"""
 
                 # ── BƯỚC 6: Lưu session ───────────────────────────────────────
                 print(f"\n{Fore.CYAN}[STEP 6] LƯU SESSION & RERUN{Fore.RESET}")
-                assistant_code = st.session_state.get("last_code")
                 try:
                     if isinstance(response, str):
                         # Handles exceptions
@@ -844,7 +857,7 @@ Question: {effective_user_question}"""
                             if tool_insight_text:
                                 response = (
                                     "Mình gặp lỗi khi dựng biểu đồ tự động, nhưng vẫn rút được kết luận từ tools:\n\n"
-                                    f"**🔧 Phân tích từ Tool Insight:**\n\n{tool_insight_text}"
+                                    f"**🔧 Phân tích:**\n\n{tool_insight_text}"
                                 )
                             else:
                                 response = (
@@ -859,22 +872,18 @@ Question: {effective_user_question}"""
                                 # Stream base response first, then stream tool insight
                                 _stream_text(response)
                                 st.markdown("\n\n---")
-                                st.markdown("**🔧 Phân tích từ Tool Insight:**\n")
+                                st.markdown("**🔧 Phân tích:**\n")
                                 _stream_text(tool_insight_text)
                                 response = (
                                     f"{response}\n\n---\n"
-                                    f"**🔧 Phân tích từ Tool Insight:**\n\n"
+                                    f"**🔧 Phân tích:**\n\n"
                                     f"{tool_insight_text}"
                                 )
                             else:
                                 _stream_text(response)
                             print(f"{Fore.GREEN}  ✓ Lưu response dạng str{Fore.RESET}")
                         st.session_state.messages.append(
-                            {
-                                "role": "assistant",
-                                "response": response,
-                                "code": assistant_code,
-                            }
+                            {"role": "assistant", "response": response}
                         )
 
                     elif isinstance(response, dict) and "figure" in response:
@@ -885,7 +894,7 @@ Question: {effective_user_question}"""
                         if tool_insight_text:
                             separator = "\n\n---\n" if combined_insight else ""
                             combined_insight += (
-                                f"{separator}**🔧 Phân tích từ Tool Insight:**\n\n"
+                                f"{separator}**🔧 Phân tích:**\n\n"
                                 f"{tool_insight_text}"
                             )
                         if combined_insight:
@@ -899,32 +908,24 @@ Question: {effective_user_question}"""
                             f"{Fore.GREEN}  ✓ Lưu response dạng dict+figure | has_analysis={bool(combined_insight)}{Fore.RESET}"
                         )
                         st.session_state.messages.append(
-                            {
-                                "role": "assistant",
-                                "response": response,
-                                "code": assistant_code,
-                            }
+                            {"role": "assistant", "response": response}
                         )
                     elif isinstance(response, Figure):
                         payload = {"figure": response}
                         if tool_insight_text:
                             payload["analysis"] = (
-                                "**🔧 Phân tích từ Tool Insight:**\n\n"
+                                "**🔧 Phân tích:**\n\n"
                                 f"{tool_insight_text}"
                             )
                         st.pyplot(response)
                         if tool_insight_text:
-                            st.markdown("**🔧 Phân tích từ Tool Insight:**\n")
+                            st.markdown("**🔧 Phân tích:**\n")
                             _stream_text(tool_insight_text)
                         print(
                             f"{Fore.GREEN}  ✓ Lưu response dạng figure | has_analysis={bool(tool_insight_text)}{Fore.RESET}"
                         )
                         st.session_state.messages.append(
-                            {
-                                "role": "assistant",
-                                "response": payload,
-                                "code": assistant_code,
-                            }
+                            {"role": "assistant", "response": payload}
                         )
 
                     else:
@@ -932,11 +933,7 @@ Question: {effective_user_question}"""
                             f"{Fore.GREEN}  ✓ Lưu response dạng {type(response).__name__}{Fore.RESET}"
                         )
                         st.session_state.messages.append(
-                            {
-                                "role": "assistant",
-                                "response": response,
-                                "code": assistant_code,
-                            }
+                            {"role": "assistant", "response": response}
                         )
                 except Exception as e:
                     exception_name = type(e).__name__
@@ -1035,7 +1032,12 @@ def main() -> None:
     header.markdown("####")
     header.header("Chatbot bất động sản", divider="violet")
     header.markdown("####")
-    header.markdown("##### Trợ lý AI hỗ trợ phân tích dữ liệu bất động sản")
+    # Subtitle changes depending on whether we're viewing an archive
+    _viewing_archive = st.session_state.get("archive_selector", "💬 Chat hiện tại") != "💬 Chat hiện tại"
+    if _viewing_archive:
+        header.markdown("##### 📁 Đang xem lịch sử hội thoại")
+    else:
+        header.markdown("##### Trợ lý AI hỗ trợ phân tích dữ liệu bất động sản")
     st.markdown("##")
 
     # Always use the single hardcoded dataset (no file upload).
@@ -1047,41 +1049,36 @@ def main() -> None:
     with st.sidebar:
         st.session_state["sample_var"] = N_SAMPLES
 
-        side_container_1 = st.sidebar.container(border=True)
-        side_container_1.markdown("##### Saved Conversations")
-        log_paths = conversation_logger.list_conversations()
-        selector_options = ["Current Chat", *log_paths]
-
-        current_viewing = st.session_state.get("viewing_log")
-        default_index = 0
-        if current_viewing in log_paths:
-            default_index = selector_options.index(current_viewing)
-
-        with side_container_1.expander("Open conversation", expanded=False):
-            selected_conversation = st.selectbox(
-                "Conversation",
-                options=selector_options,
-                index=default_index,
-                format_func=lambda item: (
-                    "Current Chat"
-                    if item == "Current Chat"
-                    else os.path.basename(str(item))
-                ),
-                key="conversation_selector",
-                label_visibility="collapsed",
-            )
-
-        selected_log_path = (
-            None if selected_conversation == "Current Chat" else selected_conversation
-        )
-        if selected_log_path != st.session_state.get("viewing_log"):
-            st.session_state["viewing_log"] = selected_log_path
-            st.rerun()
-
         # Button to delete chat history
         side_container_2 = st.sidebar.container(border=True)
         side_container_2.button(
             "🗑️ &nbsp;&nbsp;Xóa hội thoại", on_click=clear_chat_history
+        )
+
+        # Archive dropdown
+        _CURRENT_LABEL = "💬 Chat hiện tại"
+        log_files = list_conversations()
+        archive_options = [_CURRENT_LABEL]
+        archive_label_to_path: dict[str, str] = {}
+        for fp in log_files:
+            basename = os.path.basename(fp)
+            label = basename.replace("conversation_", "").replace(".json", "")
+            # "2026-05-11_16-38-48" → "2026-05-11 16:38:48"
+            label = label.replace("_", " ", 1).replace("-", ":", 2)
+            archive_options.append(label)
+            archive_label_to_path[label] = fp
+
+        side_archive = st.sidebar.container(border=True)
+        selected_archive_label = side_archive.selectbox(
+            "🗂️ Lịch sử hội thoại",
+            options=archive_options,
+            index=0,
+            key="archive_selector",
+        )
+        selected_log = (
+            None
+            if selected_archive_label == _CURRENT_LABEL
+            else archive_label_to_path.get(selected_archive_label)
         )
 
         # Temperature only (hardcoded dataset + Ollama model).
@@ -1099,7 +1096,13 @@ def main() -> None:
     else:
         agent.llm = llm
         agent.data = list(data.values())
-    process_chat(agent, llm, data)
+
+    if selected_log is not None:
+        # ── Chế độ xem archive (view-only) ───────────────────────────
+        _render_archive_view(selected_log)
+    else:
+        # ── Chế độ chat bình thường ───────────────────────────────────
+        process_chat(agent, llm, data)
 
 
 if __name__ == "__main__":
