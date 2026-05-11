@@ -2,10 +2,9 @@
 """
 Prompt builder with RAG docs (ChromaDB).
 
-Changes from the original baseline:
-  1. Import rag_docs_manager at the top.
-  2. In process_prompt(): call build_rag_context() and inject into prompt_main.
-  3. define_graph_type() extended for province / ranking style questions.
+Uses rag_docs_manager in process_prompt(); chart code is guided with short,
+task-agnostic rules so the model picks matplotlib/seaborn visuals from the
+question and dtypes.
 """
 
 import traceback
@@ -31,46 +30,25 @@ STRICT_PROMPT_RULES = """
 - Do NOT call the network or read files outside the current context.
 - Do NOT use fake or illustrative numbers as if they were real query results.
 - If a required column is missing, set `result` to a Vietnamese string explaining the missing data.
-- For charts use matplotlib and seaborn only. Do NOT use plotly, plotly express, or bokeh.
-- Do NOT call plt.show(). Build a matplotlib.figure.Figure and pass it in `result` as specified.
+- Charts: matplotlib and seaborn only; no plotly/bokeh. Do not call plt.show(); build a Figure and assign per contract below.
 - Prefer brief Vietnamese comments on important logic blocks in generated code.
 </strict_rules>
 """
 
 
-def _matplotlib_graph_hints(graph_type: str) -> str:
+def _matplotlib_graph_hints(_graph_type: str) -> str:
     """
-    Inline matplotlib/seaborn patterns per routed graph type (replaces ragdata/*.txt).
+    Short, chart-agnostic plotting hints (router may still set _graph_type for logging).
+    The model chooses chart types from <main_question> and column dtypes.
     """
-    common = """
-- Use fig, ax = plt.subplots(figsize=(10, 6)) unless a multi-panel layout needs otherwise; fig.tight_layout() before assigning `result`.
-- Rotate crowded category labels (~45°). Prefer sns.set_theme(style=\"whitegrid\") when it helps readability.
+    return """
+<code_ref>
+- Use `fig, ax = plt.subplots(figsize=(10, 6))` (or more axes if needed); call `fig.tight_layout()` before assigning `result`.
+- Pick sns/plt APIs that fit the task (counts/ranking → bar; distribution of one numeric → hist/KDE; numeric vs numeric → scatter; numeric by category → box/violin; shares of few categories → pie with cap + "Khác"; time series → line; two numeric densities → kdeplot; correlations → heatmap on numeric columns only).
+- If the user names an exotic chart (treemap, sunburst, candlestick, true map), approximate readably with supported primitives and state the limitation in `analysis`.
+- Rotate crowded tick labels (~45°); `sns.set_theme(style="whitegrid")` when it helps. All title/axis/legend text in Vietnamese.
+</code_ref>
 """
-    hints: dict[str, str] = {
-        "bar_plot": "sns.barplot(data=df, x=..., y=..., ax=ax) or grouped counts: s = df[col].value_counts(); s.plot(kind='bar', ax=ax). For rankings, sort values descending first.",
-        "scatter_2d_plot": "sns.scatterplot(data=df, x=..., y=..., ax=ax, alpha=0.3-0.6) for dense clouds; cite trend/outliers in analysis.",
-        "bubble_plot": "sns.scatterplot(..., size=..., sizes=(20, 400), ax=ax) or ax.scatter with s= array scaled from a third numeric column.",
-        "scatter_3d_plot": "from mpl_toolkits.mplot3d import Axes3D  # use fig.add_subplot(projection='3d') then ax.scatter3D(xs, ys, zs).",
-        "line_plot": "sns.lineplot(data=df, x=..., y=..., ax=ax) or df.sort_values(...).plot(x=..., y=..., ax=ax).",
-        "histogram_plot": "sns.histplot(data=df, x=..., ax=ax, kde=False) or df[col].plot.hist(ax=ax, bins=...).",
-        "pie_plot": "df[col].value_counts().plot.pie(ax=ax, autopct='%1.1f%%') or ax.pie(...); limit slices (e.g. top N + Other).",
-        "box_plot": "sns.boxplot(data=df, x=..., y=..., ax=ax) or sns.boxplot(x=group, y=value, data=df, ax=ax).",
-        "area_plot": "df.pivot_table(...).plot.area(ax=ax) or fill_between for stacked trends.",
-        "heatmap": "sns.heatmap(df[numeric_cols].corr(), annot=True, fmt='.2f', cmap='coolwarm', ax=ax, center=0).",
-        "violin_plot": "sns.violinplot(data=df, x=..., y=..., ax=ax).",
-        "density_contour_plot": "sns.kdeplot(data=df, x=..., y=..., fill=True, ax=ax) for 2D density.",
-        "polar_plot": "ax = fig.add_subplot(projection='polar'); ax.plot(theta, r).",
-        "surface_plot": "from mpl_toolkits.mplot3d import Axes3D; plot_surface on 3D axes for grid Z.",
-        "candle_plot": "matplotlib does not have native OHLC; use line plot of close or bar chart of range per period, and state limitation in analysis.",
-        "treemap_plot": "No native treemap; use horizontal bar of top categories by value, or stacked bar — note the mapping in analysis.",
-        "sunburst_plot": "No native sunburst; use nested bar or grouped bar for top two levels — note the mapping in analysis.",
-        "choroplethmap_plot": "Without geopandas, approximate with bar chart by Province/region column; mention simplification in analysis.",
-        "densitymap_plot": "Approximate with 2D kdeplot on lon/lat if columns exist; else bar by region.",
-        "scattermap_plot": "If lat/lon exist use scatterplot colored by metric; else bar by province.",
-        "base_ref": "Pick sns or ax API consistent with <main_question>; keep layout readable and titled in Vietnamese.",
-    }
-    body = hints.get(graph_type, hints["base_ref"])
-    return f"\n\n<code_ref>\n{common}\n{body}\n</code_ref>\n"
 
 SELF_CHECK_INSTRUCTIONS = """
 <self_check_before_return>
@@ -85,49 +63,22 @@ Before answering, self-check:
 
 def classify_intent(llm: object, question: str, history: str) -> dict:
     """
-    LLM-based intent classification (replaces rigid keyword matching).
+    LLM-based intent + optional default chart tag (soft hint; codegen still decides details).
     """
     prompt = f"""
-Analyze the user's question about the Vietnam housing dataset and return one JSON object only.
+You route questions about the user's tabular (housing) dataset. Return one JSON object only.
 
-Intent types:
-1. 'data_analysis': Needs computation, charts, or statistics (e.g. plot price, average area).
-2. 'metadata_query': Asks about data meaning, column definitions, or units (e.g. what is the address column).
-3. 'general_chat': Greetings or off-topic chat.
+Intents:
+- data_analysis: statistics, filters, comparisons, or visuals from the data.
+- metadata_query: column meanings, units, definitions.
+- general_chat: greetings or off-topic.
 
-## Analytical intent recognition
+analysis_intent (only when intent=data_analysis): physical_structure_vs_price | bigger_equals_more_expensive | ambiguous | none — semantic tag for written analysis, not a command to force one chart type.
 
-The user may phrase questions in different ways; map the underlying meaning to one of the two
-analytical intents below when applicable. Do not rely on exact keyword matching.
+graph_type: optional single internal label when a chart is clearly implied and one type stands out; otherwise "none".
+Allowed labels: scatter_2d_plot, bubble_plot, scatter_3d_plot, bar_plot, line_plot, histogram_plot, pie_plot, box_plot, area_plot, heatmap, violin_plot, density_contour_plot, polar_plot, surface_plot, candle_plot, treemap_plot, sunburst_plot, choroplethmap_plot, densitymap_plot, scattermap_plot, table, none.
 
-### Predefined analytical intents
-
-Intent 1 — Physical structure vs. price
-The user wants to understand how measurable physical attributes (area, floors, bedrooms,
-bathrooms, frontage) relate to or influence selling price.
-
-Intent 2 — Bigger = more expensive?
-The user wants to verify whether larger homes are always priced higher, including exceptions,
-nuances, or non-linear relationships.
-
-### Ambiguous input
-If the message could map to either analytical intent or clearly matches neither, set
-analysis_intent to 'ambiguous' so the assistant can ask a short clarifying question.
-
-Return exactly one JSON object with this shape:
-{{
-    "intent": "data_analysis" | "metadata_query" | "general_chat",
-    "graph_type": "scatter_2d_plot" | "box_plot" | "bar_plot" | "treemap_plot" | "none",
-    "target_col": "related column name or none",
-    "analysis_intent": "physical_structure_vs_price" | "bigger_equals_more_expensive" | "ambiguous" | "none"
-}}
-
-Rules for graph_type when intent is data_analysis:
-- analysis_intent='physical_structure_vs_price' → prefer "scatter_2d_plot" (area vs price),
-  or "box_plot"/"bar_plot" if the question emphasizes comparison by floors/bedrooms/bathrooms/frontage.
-- analysis_intent='bigger_equals_more_expensive' → prefer "box_plot" by area groups,
-  or "scatter_2d_plot" to surface outliers.
-- Otherwise use "none".
+Also set "target_col" to one relevant column name from the question or "none".
 
 Conversation history:
 {history}
@@ -189,30 +140,6 @@ def _graph_type_from_keywords(question_user: str) -> str | None:
     ):
         return "scattermap_plot"
 
-    province_ranking_markers = [
-        "tỉnh nào",
-        "thành phố nào",
-        "province",
-        "xuất hiện nhiều nhất",
-        "nhiều nhất trong dataset",
-        "phân bổ theo tỉnh",
-        "top tỉnh",
-        "xếp hạng tỉnh",
-        "tỉnh nào nhiều",
-        "tỉnh nào ít",
-        "thành nào",
-    ]
-    if any(m in q for m in province_ranking_markers) and (
-        "bar" in q
-        or "cột" in q
-        or "biểu đồ" in q
-        or "vẽ" in q
-        or "đồ thị" in q
-        or "nhất" in q
-        or "rank" in q
-    ):
-        return "bar_plot"
-
     if "pie" in q or "tròn" in q or "tỉ lệ %" in q:
         return "pie_plot"
     if "box" in q or "hộp" in q or "quartile" in q or "tứ phân vị" in q:
@@ -239,138 +166,13 @@ def _graph_type_from_keywords(question_user: str) -> str | None:
 
 
 def define_graph_type(llm: object, question_user: str, hist_questions: str) -> str:
-    q = question_user.lower()
-    price_driver_keywords = [
-        "ảnh hưởng",
-        "tác động",
-        "liệu",
-        "có luôn",
-        "nhà to hơn",
-        "diện tích",
-        "phòng ngủ",
-        "phòng tắm",
-        "số tầng",
-        "mặt tiền",
-    ]
-    if any(kw in q for kw in price_driver_keywords) and (
-        "giá" in q or "price" in q
-    ):
-        return "scatter_2d_plot"
-
+    """Prefer explicit chart words in the question; otherwise ask the router LLM once."""
     keyword_graph = _graph_type_from_keywords(question_user)
     if keyword_graph is not None:
         return keyword_graph
 
     res = classify_intent(llm, question_user, hist_questions)
-    analysis_intent = res.get("analysis_intent", "none")
-    graph_type = res.get("graph_type", "none")
-
-    if analysis_intent == "physical_structure_vs_price":
-        if any(
-            k in q
-            for k in [
-                "số tầng",
-                "tầng",
-                "phòng ngủ",
-                "phòng tắm",
-                "mặt tiền",
-                "frontage",
-            ]
-        ):
-            return "box_plot"
-        return "scatter_2d_plot"
-
-    if analysis_intent == "bigger_equals_more_expensive":
-        if any(
-            k in q
-            for k in [
-                "luôn",
-                "always",
-                "ngoại lệ",
-                "exception",
-                "không phải lúc nào",
-            ]
-        ):
-            return "box_plot"
-        return "scatter_2d_plot"
-
-    return graph_type
-
-
-def _deprecated_define_graph_type(
-    llm: object, question_user: str, hist_questions: str
-) -> str:
-    """
-    Legacy LLM router for graph type (RAG routing). Kept for reference; prefer define_graph_type().
-    """
-
-    prompt_template = f"""
-    <question>
-    Answer the following question with a single specific word.
-    {question_user}
-    Answer with just one word.
-    </question>
-
-    <hist_questions>
-    {hist_questions}
-    </hist_questions>
-
-    Analyze the question within the <question> tags and determine which type of graph is most appropriate for
-    the question, according to the options listed in <allowed_words>.
-
-    Analyze message history within the <hist_questions> tags for more context in response.
-
-    <allowed_words>
-    answer "treemap_plot" if has in question (treemap, or Vietnamese "biểu đồ treemap")
-    answer "sunburst_plot" if has in question (sunburst, or Vietnamese layered pie chart phrasing)
-    answer "density_contour_plot" if has in question (density contour, contour plot phrasing)
-    answer "violin_plot" if has in question (violin plot phrasing in EN or VN)
-    answer "candle_plot" if has in question (candle, OHLC, candlestick)
-    answer "heatmap" if has in question (heatmap, correlation matrix phrasing in EN or VN)
-    answer "scatter_2d_plot" if has in question (scatter, scatter plot phrasing in EN or VN)
-    answer "bubble_plot" if has in question (bubble chart phrasing in EN or VN)
-    answer "scatter_3d_plot" if has in question (scatter 3d phrasing)
-    answer "surface_plot" if has in question (3d surface phrasing)
-    answer "bar_plot" if has in question (bar chart phrasing in EN or VN)
-                     OR if the question asks about province/city frequency or ranking, e.g. Vietnamese:
-                     which province appears most/least, distribution by province, top provinces, ranking.
-    answer "line_plot" if has in question (line chart, trend over time phrasing)
-    answer "histogram_plot" if has in question (histogram, distribution, frequency phrasing)
-    answer "pie_plot" if has in question (pie chart, percentage breakdown phrasing)
-    answer "box_plot" if has in question (box plot, quartile phrasing)
-    answer "area_plot" if has in question (area chart phrasing; not the column "Area" alone)
-    answer "choroplethmap_plot" if has in question (choropleth map phrasing)
-    answer "densitymap_plot" if has in question (density map phrasing)
-    answer "scattermap_plot" if has in question (scatter map / points on map phrasing)
-    answer "polar_plot" if has in question (radar / polar / spider chart phrasing)
-    answer "table" if has in question (dataframe table, show as table phrasing)
-    answer "table" if has in question (dataframe / table phrasing including former plotly-table wording)
-    answer "base_ref" if there is nothing related to the question.
-    </allowed_words>
-
-    Use context information for accuracy in the answer.
-    DECLARE ONLY one WORD in response according with <allowed_words> tags.
-
-    Response examples:
-    question: 'vẽ biểu đồ cột theo tỉnh thành'
-    response: 'bar_plot'
-
-    question: 'tỉnh nào xuất hiện nhiều nhất trong dataset?'
-    response: 'bar_plot'
-
-    question: 'tỉnh nào có nhiều bất động sản nhất?'
-    response: 'bar_plot'
-
-    question: 'thống kê số lượng bất động sản theo từng tỉnh'
-    response: 'bar_plot'
-
-    question: 'phân phối giá nhà theo histogram'
-    response: 'histogram_plot'
-
-    """
-
-    response = llm.invoke(prompt_template)
-    return response.content.strip()
+    return res.get("graph_type", "none") or "none"
 
 
 def process_prompt(
@@ -488,69 +290,17 @@ def process_prompt(
 # - Set `result = {"figure": fig, "analysis": analysis}`.
 # Do NOT set `result` to only the figure.
 """
-        province_hint = ""
-        province_keywords = [
-            "tỉnh nào",
-            "thành phố nào",
-            "province",
-            "xuất hiện nhiều nhất",
-            "phân bổ theo tỉnh",
-            "bao nhiêu bất động sản",
-            "top tỉnh",
-            "xếp hạng tỉnh",
-        ]
-        if any(kw in user_question.lower() for kw in province_keywords):
-            province_hint = """
-        # PROVINCE RANKING HINT:
-        # The question is about counting listings by province/city.
-        # Use column 'Province' (province or city name).
-        # Standard pattern:
-        #   province_counts = df['Province'].value_counts().reset_index()
-        #   province_counts.columns = ['Province', 'Count']
-        #   province_counts['Percentage'] = (province_counts['Count'] / len(df) * 100).round(2)
-        # Prefer a horizontal bar chart (orientation='h') sorted high to low.
-        # Show count labels on each bar. Use Vietnamese labels for the chart.
-"""
-
         price_driver_hint = ""
-        intent_hint = ""
         if is_price_driver_question:
             price_driver_hint = """
-        # PRICE DRIVER HINT:
-        # The question asks how area/structure relates to price.
-        # You MUST give quantitative evidence, cite exceptions, and state a conditional conclusion.
-        # Do not claim absolute causality; explicitly note that correlation is not causation (in Vietnamese in `analysis`).
-        # Prefer scatter (area vs price) plus group comparisons by Floors/Bedrooms/Bathrooms/Frontage.
-"""
-            intent_hint = """
-        # INTENT RECOGNITION:
-        # Map the question semantically to one of two intents:
-        # (1) Physical structure vs. price
-        # (2) Bigger = more expensive?
-        # If ambiguous between the two, ask the user a clarifying question before drawing a firm conclusion.
-        #
-        # CHART SELECTION GUIDELINES:
-        # - Intent 1:
-        #   + Scatter 2D (area vs price) for continuous trend.
-        #   + Box/bar by Floors/Bedrooms/Bathrooms/Frontage for structural group comparison.
-        # - Intent 2:
-        #   + Box plot by area buckets to show price overlap between smaller vs larger homes.
-        #   + Scatter 2D to highlight exceptions (small expensive vs large cheap).
-        # Do not use a single chart alone for an absolute conclusion when exceptions exist.
+        # Giá vs cấu trúc/diện tích: trong `analysis` hãy dẫn số liệu từ biểu đồ/bảng, nêu ngoại lệ nếu có, tránh khẳng định nhân quả tuyệt đối (tương quan không phải nguyên nhân) — viết bằng tiếng Việt.
 """
 
         prompt_context = f"""
-        {province_hint}
         {price_driver_hint}
-        {intent_hint}
-        For plots, use matplotlib and seaborn only; assign a matplotlib Figure per the result contract above.
-        All visible text in titles, axis labels, legends, etc., MUST be in Vietnamese.
-        Set the legend title from the data when not specified by the user.
-        On the x and y axes, rotate long date or category labels to about 45 degrees when it improves readability.
-        Derive axis label text from <main_question> where sensible.
-        Derive the chart title from <main_question>.
-        Follow the blocks below exactly, always driven by <main_question>.
-        Use patterns in <code_ref> as a baseline for <main_question>.
+        Matplotlib/seaborn only; gán Figure theo contract ở trên. Tiêu đề/trục/chú giải bằng tiếng Việt.
+        Xoay nhãn trục khi đông category hoặc datetime. Bám <main_question> và dtype trong <metadata>.
+        Tham khảo gợi ý kỹ thuật ngắn trong <code_ref> (chọn kiểu biểu đồ phù hợp bạn tự quyết).
         {params_plot}"""
     elif graph_type == "table":
         result_instruction = """
