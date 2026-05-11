@@ -65,24 +65,6 @@ def _contains_any(text: str, keywords: list[str]) -> bool:
     return any(k.lower() in t for k in keywords)
 
 
-def _is_price_driver_question(text: str) -> bool:
-    q = text.lower()
-    driver_keywords = [
-        "ảnh hưởng",
-        "tác động",
-        "liệu",
-        "có luôn",
-        "nhà to hơn",
-        "diện tích",
-        "phòng ngủ",
-        "phòng tắm",
-        "số tầng",
-        "mặt tiền",
-        "cấu trúc",
-    ]
-    return any(kw in q for kw in driver_keywords) and ("giá" in q or "price" in q)
-
-
 def _is_dataset_followup_for_analysis(
     user_question: str, messages: list[dict] | None
 ) -> bool:
@@ -384,37 +366,16 @@ def classify_intent_llm(user_question: str, llm: object) -> str:
         "direct_chat",
     ]
 
-    classifier_prompt = f"""
-You are an intent classifier for a Vietnamese data analysis assistant.
-Given the user's message (may contain typos), choose exactly one intent label.
+    classifier_prompt = f"""Vietnamese data assistant — one JSON: {{"intent": "<label>"}}.
+Labels: greeting | dataset_info | context_query | visualization_request | direct_chat
 
-Definitions:
-- greeting: user is saying hello/hi/xin chao and is not requesting charts/code.
-- dataset_info: user asks what columns/features exist in the dataset as a list, wants to see all column names, or asks "dataset gom nhung gi". Does NOT include questions about the meaning of a specific column/field.
-- context_query: user asks about the meaning, description, or background of a specific column/field/attribute, OR asks about the story/origin/context behind the dataset. Examples: "truong address co y nghia gi?", "bathroom la gi?", "cau chuyen phia sau dataset", "giai thich cot price".
-- visualization_request: user asks for charts/plots/figures/maps/tables based on data, or says "vẽ/biểu đồ/plot/chart/graph" etc.
-  Also treat ranking/comparison questions as visualization_request even if the user does NOT explicitly say "chart", for example:
-  "cái nào nhiều nhất", "tỉnh/thành nào chiếm nhiều nhất", "top", "so sánh", "cao nhất/thấp nhất", "nhiều/ít hơn", "xếp hạng".
-- direct_chat: everything else (general questions, wording not clearly requesting plots or dataset description).
+- greeting: hello only, no data task.
+- dataset_info: list columns/schema/shape, not column meaning.
+- context_query: meaning of a specific field, or dataset story/context.
+- visualization_request: charts/tables OR ranking/compare/top/min/max from data (even without word "chart").
+- direct_chat: else.
 
-Examples:
-- "Tỉnh thành nào có nhiều bất động sản nhất?" → visualization_request
-- "Cái nào cao nhất?" → visualization_request
-- "Top 5 tỉnh có giá cao nhất" → visualization_request
-- "So sánh giá theo loại nhà" → visualization_request
-- "truong address co y nghia gi?" → context_query
-- "bathroom la gi?" → context_query
-- "cau chuyen phia sau dataset" → context_query
-- "dataset co nhung cot nao?" → dataset_info
-...
-
-Return ONLY a JSON object with this exact schema:
-{{"intent": "<one_of_intent_labels>"}}
-where <one_of_intent_labels> MUST be one of: {intent_labels}
-
-User message:
-{user_question}
-""".strip()
+Message: {user_question}""".strip()
 
     # Make classification deterministic (minimize randomness).
     prev_temp = getattr(llm, "temperature", None)
@@ -667,15 +628,11 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
                             effective_user_question, top_k=3, min_similarity=0.2
                         )
                         rag_section = rag_context if rag_context else ""
-                        rag_prompt = f"""You are an expert on the Vietnam housing dataset.
-The user is asking about column meaning, definitions, or broader dataset context.
-Answer concisely and accurately in Vietnamese only.
-Do NOT generate code; reply in plain language only.
-
+                        rag_prompt = f"""Vietnam housing dataset expert. Answer in Vietnamese only, no code.
+Context:
 {rag_section}
 
-User question:
-{effective_user_question}"""
+Question: {effective_user_question}"""
                         response = _stream_llm_response(llm, rag_prompt)
                         if not rag_context:
                             print(
@@ -694,12 +651,10 @@ User question:
                         f"{Fore.YELLOW}  → Trả lời nhanh: DIRECT_LLM_CHAT{Fore.RESET}"
                     )
                     # Keep the instruction text in English; force Vietnamese output.
-                    chat_prompt = f"""
-You are a helpful data assistant for Vietnamese users.
-Do NOT generate any code and do NOT request the system to draw plots.
-Answer in Vietnamese only.
-User message: {effective_user_question}
-"""
+                    chat_prompt = (
+                        "Data assistant for Vietnamese users. No code, no plot requests. "
+                        f"Vietnamese only.\n\n{effective_user_question}"
+                    )
                     try:
                         response = _stream_llm_response(llm, chat_prompt)
                         print(

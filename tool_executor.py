@@ -59,7 +59,7 @@ def _dataset_brief(df: pd.DataFrame) -> str:
     if "price" in low or "price_per_m2" in low:
         hints.append("Price-like columns → domain tools `analyze_price_drivers`, `compare_mean_by_group`, etc.")
     if hints:
-        lines.append("Dataset hints: " + " ".join(hints))
+        lines.append("Hints: " + " ".join(hints))
     return "\n".join(lines)
 
 
@@ -115,7 +115,7 @@ def _tool_result_to_llm_json(tool_result: Any) -> str:
 
 
 # ── Build system prompt ────────────────────────────────────────────────────────
-def _build_system_prompt(user_question: str = "", df: Optional[pd.DataFrame] = None) -> str:
+def _build_system_prompt(df: Optional[pd.DataFrame] = None) -> str:
     """English system instructions; model must still answer end users in Vietnamese."""
     tool_names = [
         t["function"]["name"]
@@ -127,56 +127,14 @@ def _build_system_prompt(user_question: str = "", df: Optional[pd.DataFrame] = N
     if df is not None and len(df.columns):
         brief = f"<dataset>\n{_dataset_brief(df)}\n</dataset>\n\n"
 
-    cols_lower = set()
-    if df is not None:
-        cols_lower = {str(c).lower() for c in df.columns}
-
-    # Keyword hints (user questions are often Vietnamese)
-    province_keywords = [
-        "tỉnh nào", "thành phố nào", "province", "xuất hiện nhiều nhất",
-        "phân bổ theo tỉnh", "bao nhiêu bất động sản ở mỗi tỉnh",
-        "top tỉnh", "xếp hạng tỉnh", "tỉnh nào nhiều nhất", "tỉnh nào ít nhất",
-    ]
-    province_note = ""
-    qlow = user_question.lower()
-    if "province" in cols_lower and any(kw in qlow for kw in province_keywords):
-        province_note = (
-            "\n⚡ Province/city frequency → call `get_province_ranking` for exact counts.\n"
-        )
-
-    price_driver_keywords = [
-        "ảnh hưởng", "tác động", "liệu", "có luôn", "nhà to hơn",
-        "diện tích", "phòng ngủ", "phòng tắm", "số tầng", "mặt tiền", "cấu trúc",
-    ]
-    price_driver_note = ""
-    if (
-        ("price" in cols_lower or "price_per_m2" in cols_lower)
-        and any(kw in qlow for kw in price_driver_keywords)
-        and ("giá" in qlow or "price" in qlow)
-    ):
-        price_driver_note = (
-            "\n⚡ Price-driver style question → prefer `analyze_property_structure_price_impact` "
-            "and `analyze_bigger_house_premium`; cross-check with `analyze_price_drivers`, "
-            "`price_vs_size_summary`, `structure_group_price_compare` when useful.\n"
-        )
-
     return (
-        "You are a senior data analyst working on the user's currently loaded tabular dataset.\n"
+        "You analyze the user's loaded table using the tools below. Pick tools from the question "
+        "and <dataset>; chain calls when needed.\n"
         f"{brief}"
-        "You may call the following tools to obtain exact numbers from the dataframe before answering:\n"
-        f"{', '.join(tool_names)}\n\n"
-        f"{province_note}{price_driver_note}"
-        "Rules:\n"
-        "- When column names, dtypes, or shape are uncertain, call `get_data_profile` first.\n"
-        "- Always call tools when specific figures are needed; do not guess.\n"
-        "- For generic exploration use `profile_column`, `filter_rows`, `pivot_summary`, "
-        "`numeric_correlation_pairs`, `compare_two_groups_stat_test`, `chi_square_categorical_association`.\n"
-        "- If a Province column exists and the user asks ranking by province → `get_province_ranking`.\n"
-        "- For comparing a numeric metric across one categorical dimension → `compare_mean_by_group`.\n"
-        "- You may chain multiple tool calls when useful.\n"
-        "- After tool results, write a concise insight in Vietnamese for the end user (max ~200 words).\n"
-        "- Stay focused on the user's question.\n"
-        "- Present numbers clearly; emphasize key values (e.g. markdown bold).\n"
+        f"Tools: {', '.join(tool_names)}\n\n"
+        "Rules: If schema is unclear → `get_data_profile` first. Need exact numbers → call tools, "
+        "never invent. After tools, reply in Vietnamese (~200 words max), focused, with key "
+        "numbers highlighted (e.g. markdown bold).\n"
     )
 
 
@@ -287,13 +245,12 @@ def run_tool_insight(
         return "⚠️ Không có tool nào được đăng ký."
 
     messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt(user_question, df)},
+        {"role": "system", "content": _build_system_prompt(df)},
         {
             "role": "user",
             "content": (
-                f"User question (Vietnamese): {user_question}\n\n"
-                "Call the appropriate tool(s) to fetch exact figures from the dataset, "
-                "then reply with a short insight. Respond in Vietnamese only."
+                f"Question (Vietnamese): {user_question}\n\n"
+                "Call tool(s) for exact figures, then answer in Vietnamese only."
             ),
         },
     ]
