@@ -8,20 +8,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objs as go
-import plotly.express as px
 
 from colorama import Fore
 from agent import AgentAI
 from prompt import process_prompt
 from styles import process_styles
 
-from langchain_groq import ChatGroq
-from langchain_cohere import ChatCohere
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
 from langchain_community.chat_models import ChatOllama
 from tool_executor import run_tool_insight
-from rag_docs_manager import build_rag_context
+from rag_docs_manager import build_rag_context, warmup_rag_embedder
 
 
 # Parameters
@@ -36,6 +31,8 @@ DATASET_PATH = (
 )
 OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+# Optional smaller/faster Ollama model for intent routing only (see classify_intent_llm fallback).
+OLLAMA_ROUTER_MODEL = os.getenv("OLLAMA_ROUTER_MODEL", "").strip()
 
 # Tool-calling insight: LLM gọi tool để tính số liệu thực → sinh insight
 ENABLE_TOOL_INSIGHT = True  # Tắt/bật tính năng tool-calling insight
@@ -171,6 +168,17 @@ def should_answer_normally(
         "dữ liệu gồm",
         "cột nào",
         "features",
+        "danh sách cột",
+        "liệt kê cột",
+        "tên các cột",
+        "schema",
+        "dtypes",
+        "kiểu dữ liệu",
+        "bao nhiêu dòng",
+        "số dòng",
+        "số cột",
+        "kích thước",
+        "shape của",
     ]
     # Câu hỏi về ý nghĩa / ngữ cảnh của cột → nên đi qua RAG, không phải overview
     context_keywords = [
@@ -258,12 +266,66 @@ def should_answer_normally(
         "ảnh hưởng",
         "tác động",
         "nhà to hơn",
+        "đồ họa",
+        "thống kê mô tả",
+        "phân tích dữ liệu",
+        "xu hướng giá",
+        "theo tỉnh",
+        "theo thành phố",
+        "theo loại nhà",
     ]
     if _contains_any(q, visualization_keywords):
         return (False, "")
 
     if _contains_any(q, dataset_keywords):
         return (True, "__DATASET_OVERLAY__")
+
+    # Numeric / statistical questions → full analysis path (no extra classifier LLM).
+    analysis_stats_keywords = [
+        "trung bình",
+        "trung vi",
+        # Avoid bare "mean"/"median"/"correlation" — substring false positives (e.g. "meaning", "decorrelation").
+        "trung bình giá",
+        "tbc ",
+        "độ lệch chuẩn",
+        "phương sai",
+        "variance",
+        "tương quan",
+        "covariance",
+        "hồi quy",
+        "regression",
+        "ngoại lệ",
+        "outlier",
+        "quantile",
+        "phân vị",
+        "tứ phân vị",
+        "min ",
+        " max ",
+        "nhỏ nhất",
+        "lớn nhất",
+        "tổng số",
+        "đếm số",
+        "bao nhiêu căn",
+        "bao nhiêu nhà",
+        "chênh lệch",
+        "khác biệt",
+        "tỉ lệ",
+        "phần trăm",
+        "phân trăm",
+        "so sánh giá",
+        "tb giá",
+        "giá tb",
+        "giá trung bình",
+        "giá trung vi",
+        "số căn",
+        "số bản ghi",
+        "số lượng nhà",
+        "đếm theo",
+        "tần suất",
+        "frequency",
+    ]
+    if _contains_any(q, analysis_stats_keywords):
+        return (False, "")
 
     # Fallback: use LLM classification (handles typos/wording variations).
     try:
@@ -376,6 +438,49 @@ User message:
             llm.temperature = prev_temp
 
 
+def _get_or_create_chat_ollama(model: str, base_url: str, temperature: float) -> ChatOllama:
+    """
+    Reuse one ChatOllama across Streamlit reruns; only sync temperature (and model/base_url if changed).
+    """
+    key = "_cached_chat_ollama"
+    llm = st.session_state.get(key)
+    if llm is not None:
+        same_model = getattr(llm, "model", None) == model
+        same_base = getattr(llm, "base_url", None) == base_url
+        if same_model and same_base:
+            if hasattr(llm, "temperature"):
+                llm.temperature = temperature
+            return llm
+    llm = ChatOllama(model=model, temperature=temperature, base_url=base_url)
+    st.session_state[key] = llm
+    return llm
+
+
+def _get_classifier_llm(main_llm: object) -> object:
+    """
+    Optional dedicated router model (OLLAMA_ROUTER_MODEL) for classify_intent_llm
+    to avoid loading the full chat model for a tiny JSON classification task.
+    """
+    if not OLLAMA_ROUTER_MODEL:
+        return main_llm
+    key = "_cached_ollama_router_llm"
+    llm = st.session_state.get(key)
+    if llm is not None:
+        same_model = getattr(llm, "model", None) == OLLAMA_ROUTER_MODEL
+        same_base = getattr(llm, "base_url", None) == OLLAMA_BASE_URL
+        if same_model and same_base:
+            if hasattr(llm, "temperature"):
+                llm.temperature = 0.0
+            return llm
+    llm = ChatOllama(
+        model=OLLAMA_ROUTER_MODEL,
+        temperature=0.0,
+        base_url=OLLAMA_BASE_URL,
+    )
+    st.session_state[key] = llm
+    return llm
+
+
 # ── Streaming helpers ─────────────────────────────────────────────────────────
 
 
@@ -403,18 +508,10 @@ def _stream_llm_response(llm: object, prompt: str) -> str:
 
 def _stream_text(text: str) -> None:
     """
-    Stream a pre-built string word-by-word (used for tool insight / static responses).
+    Show a pre-built string (used for tool insight / static responses).
+    Word-by-word animation was removed: it added O(n) sleeps and dominated latency.
     """
-    import time
-
-    placeholder = st.empty()
-    displayed = ""
-    words = text.split(" ")
-    for i, word in enumerate(words):
-        displayed += ("" if i == 0 else " ") + word
-        placeholder.markdown(displayed + "▌")
-        time.sleep(0.012)
-    placeholder.markdown(displayed)
+    st.markdown(text)
 
 
 # Session_state reruns variables
@@ -424,8 +521,6 @@ if "context_code_var" not in st.session_state:
     st.session_state["context_code_var"] = False
 if "count_var" not in st.session_state:
     st.session_state["count_var"] = 1
-if "lang_var" not in st.session_state:
-    st.session_state["lang_var"] = "vi"
 if "response_error_var" not in st.session_state:
     st.session_state["response_error_var"] = ""
 if "sample_var" not in st.session_state:
@@ -448,10 +543,10 @@ def clear_chat_history() -> None:
     st.session_state["messages"] = []
 
     # Stop agent runtime
-    agent = st.session_state["agent_var"]
+    agent = st.session_state.get("agent_var")
     if agent is not None:
         agent.chat_stop()
-        del agent
+    st.session_state["agent_var"] = None
 
 
 def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
@@ -553,7 +648,9 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
             # If the user message is not asking for visualization/data plots,
             # answer normally to avoid slow "generate+execute code" flow.
             should_short_circuit, hint_response = should_answer_normally(
-                effective_user_question, llm, st.session_state.messages
+                effective_user_question,
+                _get_classifier_llm(llm),
+                st.session_state.messages,
             )
 
             print(
@@ -570,17 +667,19 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
                 elif hint_response == "__RAG_CONTEXT__":
                     print(f"{Fore.YELLOW}  → Trả lời nhanh: RAG_CONTEXT{Fore.RESET}")
                     try:
-                        from rag_docs_manager import build_rag_context
-
                         rag_context = build_rag_context(
                             effective_user_question, top_k=3, min_similarity=0.2
                         )
                         rag_section = rag_context if rag_context else ""
-                        rag_prompt = f"""Bạn là chuyên gia tư vấn về dataset bất động sản Việt Nam.
-Người dùng hỏi về ý nghĩa/ngữ cảnh của dữ liệu. Hãy trả lời bằng tiếng Việt, súc tích và chính xác.
-Không sinh code. Chỉ giải thích bằng ngôn ngữ tự nhiên.
+                        rag_prompt = f"""You are an expert on the Vietnam housing dataset.
+The user is asking about column meaning, definitions, or broader dataset context.
+Answer concisely and accurately in Vietnamese only.
+Do NOT generate code; reply in plain language only.
+
 {rag_section}
-Câu hỏi: {effective_user_question}"""
+
+User question:
+{effective_user_question}"""
                         response = _stream_llm_response(llm, rag_prompt)
                         if not rag_context:
                             print(
@@ -630,24 +729,6 @@ User message: {effective_user_question}
 
             # ── BƯỚC 2: Build prompt + Agent chat ────────────────────────────
             print(f"\n{Fore.CYAN}[STEP 2] BUILD PROMPT & AGENT CHAT{Fore.RESET}")
-            is_price_driver_question = _is_price_driver_question(
-                effective_user_question
-            )
-            precomputed_tool_insight: str | None = None
-            if ENABLE_TOOL_INSIGHT and is_price_driver_question:
-                print(
-                    f"{Fore.WHITE}  price_driver_question=True → chạy tool insight trước code-agent{Fore.RESET}"
-                )
-                main_df = _get_main_df(data)
-                with st.spinner("🔧 Đang phân tích price drivers bằng tools..."):
-                    precomputed_tool_insight = run_tool_insight(
-                        user_question=effective_user_question,
-                        df=main_df,
-                        ollama_base_url=OLLAMA_BASE_URL,
-                        model=OLLAMA_MODEL,
-                        lang=st.session_state.get("lang_var", "vi"),
-                        verbose=VERBOSE,
-                    )
             with st.spinner("Đang phân tích..."):
                 try:
                     prompt = process_prompt(
@@ -715,8 +796,8 @@ User message: {effective_user_question}
                     elif isinstance(response, go.Figure):
                         fig_for_insight = response
 
-                tool_insight_text: str | None = precomputed_tool_insight
-                # Chạy tool insight cho cả câu hỏi có biểu đồ lẫn câu hỏi thống kê thuần
+                tool_insight_text: str | None = None
+                # Single tool-insight pass per request (after agent) — avoids duplicate Ollama rounds.
                 if ENABLE_TOOL_INSIGHT and (
                     fig_for_insight is not None or isinstance(response, str)
                 ):
@@ -725,16 +806,14 @@ User message: {effective_user_question}
                         f"{Fore.WHITE}  has_figure={fig_for_insight is not None} | is_str={isinstance(response, str)}{Fore.RESET}"
                     )
                     main_df = _get_main_df(data)
-                    if tool_insight_text is None:
-                        with st.spinner("🔧 Đang gọi tool phân tích số liệu..."):
-                            tool_insight_text = run_tool_insight(
-                                user_question=effective_user_question,
-                                df=main_df,
-                                ollama_base_url=OLLAMA_BASE_URL,
-                                model=OLLAMA_MODEL,
-                                lang=st.session_state.get("lang_var", "vi"),
-                                verbose=VERBOSE,
-                            )
+                    with st.spinner("🔧 Đang gọi tool phân tích số liệu..."):
+                        tool_insight_text = run_tool_insight(
+                            user_question=effective_user_question,
+                            df=main_df,
+                            ollama_base_url=OLLAMA_BASE_URL,
+                            model=OLLAMA_MODEL,
+                            verbose=VERBOSE,
+                        )
                     if tool_insight_text:
                         preview = tool_insight_text[:100].replace("\n", " ")
                         print(
@@ -922,6 +1001,12 @@ def extract_dataframes(raw_files: list) -> dict:
     return dfs
 
 
+@st.cache_resource
+def _warmup_rag_resources() -> None:
+    """Prime embedding model + Chroma so the first user RAG query is faster."""
+    warmup_rag_embedder()
+
+
 def main() -> None:
     """
     Main function as entry point for the script.
@@ -942,9 +1027,9 @@ def main() -> None:
     data_df = load_main_dataset()
     data = {"DF_1___vietnam_housing_dataset_cleaned": data_df}
 
+    _warmup_rag_resources()
+
     with st.sidebar:
-        # Force Vietnamese for user prompts and chatbot output.
-        st.session_state["lang_var"] = "vi"
         st.session_state["sample_var"] = N_SAMPLES
 
         # Button to delete chat history
@@ -960,12 +1045,14 @@ def main() -> None:
         )
 
     # Always use Ollama local model with hardcoded model name.
-    llm = ChatOllama(
-        model=OLLAMA_MODEL,
-        temperature=llm_temp,
-        base_url=OLLAMA_BASE_URL,
-    )
-    agent = get_llm_agent(data, llm)
+    llm = _get_or_create_chat_ollama(OLLAMA_MODEL, OLLAMA_BASE_URL, llm_temp)
+    # Reuse one AgentAI across Streamlit reruns; only refresh LLM + data (e.g. temperature slider).
+    agent = st.session_state.get("agent_var")
+    if agent is None:
+        agent = get_llm_agent(data, llm)
+    else:
+        agent.llm = llm
+        agent.data = list(data.values())
     process_chat(agent, llm, data)
 
 

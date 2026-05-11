@@ -1,104 +1,136 @@
 # prompt.py
 """
-Prompt builder tích hợp RAG docs tiêu chuẩn (ChromaDB).
+Prompt builder with RAG docs (ChromaDB).
 
-Thay đổi so với bản gốc:
-  1. Import rag_docs_manager ở đầu file.
-  2. Trong process_prompt(): gọi build_rag_context() và inject vào prompt_main.
-  3. define_graph_type() mở rộng nhận diện câu hỏi về tỉnh/thành và ranking.
+Changes from the original baseline:
+  1. Import rag_docs_manager at the top.
+  2. In process_prompt(): call build_rag_context() and inject into prompt_main.
+  3. define_graph_type() extended for province / ranking style questions.
 """
 
 import os
-import sys
 import traceback
+import functools
 import streamlit as st
 
 from io import StringIO
 from colorama import Fore
 
-# ── [NEW] RAG docs ────────────────────────────────────────────────────────────
-from rag_docs_manager import build_rag_context, sync_index
+from rag_docs_manager import build_rag_context
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Prompt guardrails (inspired by good.py strict prompting)
+
+@functools.lru_cache(maxsize=48)
+def _load_ragdata_code_ref(graph_type: str) -> str:
+    """
+    Load ragdata/<graph_type>.txt or fall back to base_ref.txt.
+    Cached: same graph_type avoids repeated disk I/O on every Streamlit rerun.
+    """
+    dir_path = "ragdata"
+    try:
+        names = os.listdir(dir_path)
+    except OSError:
+        names = []
+    for file_ in names:
+        file_name, file_ext = os.path.splitext(file_)
+        if file_name == graph_type and file_ext == ".txt":
+            file_path = os.path.join(dir_path, file_)
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    return f"\n\n<code_ref>\n{f.read()}\n</code_ref>"
+            except OSError:
+                break
+    try:
+        with open(os.path.join(dir_path, "base_ref.txt"), "r", encoding="utf-8") as f:
+            return f"\n\n<code_ref>\n{f.read()}\n</code_ref>"
+    except OSError:
+        return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# End-user outputs are Vietnamese; instructions are English for model clarity.
+VIETNAMESE_USER_FACING_OUTPUT = (
+    "All natural-language output for the end user (variable `analysis`, string `result`, "
+    "chart titles, axis labels, legends, hover/tooltip text, and any dataframe presentation text) "
+    "MUST be written in Vietnamese. Configure Plotly so every user-visible string is Vietnamese."
+)
+
 STRICT_PROMPT_RULES = """
 <strict_rules>
-- KHONG bịa dữ liệu: chỉ dùng cột tồn tại trong <metadata>.
-- KHONG gọi mạng, KHONG đọc file ngoài ngữ cảnh hiện tại.
-- KHONG dùng dữ liệu giả/lấy ví dụ giả để tính kết quả.
-- Neu cột cần thiết không tồn tại, đặt `result` là chuỗi tiếng Việt giải thích thiếu dữ liệu.
-- KHONG dùng `plt`/matplotlib. Với biểu đồ, chỉ dùng Plotly.
-- Ưu tiên comment ngắn gọn bằng tiếng Việt cho các khối logic quan trọng.
+- Do NOT invent data: only use columns that exist in <metadata>.
+- Do NOT call the network or read files outside the current context.
+- Do NOT use fake or illustrative numbers as if they were real query results.
+- If a required column is missing, set `result` to a Vietnamese string explaining the missing data.
+- Do NOT use `plt` / matplotlib. For charts, use Plotly only.
+- Prefer brief Vietnamese comments on important logic blocks in generated code.
 </strict_rules>
 """
 
 SELF_CHECK_INSTRUCTIONS = """
 <self_check_before_return>
-Trước khi trả lời, tự kiểm tra:
-1) Mọi tên cột đều có trong dữ liệu mẫu.
-2) Mọi phép tính đều dựa trên dataframe thật, không hard-code số liệu.
-3) `result` đúng kiểu theo yêu cầu (figure+analysis / dataframe / string).
-4) Không có code truy cập internet hoặc tài nguyên ngoài bài toán.
+Before answering, self-check:
+1) Every column name exists in the sample data.
+2) Every calculation uses the real dataframe, not hard-coded figures.
+3) `result` has the correct type (figure+analysis / dataframe / string) as required.
+4) No code accesses the internet or resources outside this task.
 </self_check_before_return>
 """
 
 
 def classify_intent(llm: object, question: str, history: str) -> dict:
     """
-    Sử dụng LLM để phân loại mục đích người dùng (Intent Classification).
-    Thay thế cho việc match từ khóa cứng nhắc.
+    LLM-based intent classification (replaces rigid keyword matching).
     """
     prompt = f"""
-    Phân tích câu hỏi của người dùng về dữ liệu bất động sản và trả về JSON.
-    
-    Các loại Intent:
-    1. 'data_analysis': Cần tính toán, vẽ biểu đồ, thống kê (ví dụ: "vẽ biểu đồ giá", "trung bình diện tích").
-    2. 'metadata_query': Hỏi về ý nghĩa dữ liệu, định nghĩa cột (ví dụ: "cột address là gì?", "giá tính bằng đơn vị nào?").
-    3. 'general_chat': Chào hỏi, tán gẫu.
+Analyze the user's question about the Vietnam housing dataset and return one JSON object only.
 
-    ## Intent Recognition
+Intent types:
+1. 'data_analysis': Needs computation, charts, or statistics (e.g. plot price, average area).
+2. 'metadata_query': Asks about data meaning, column definitions, or units (e.g. what is the address column).
+3. 'general_chat': Greetings or off-topic chat.
 
-    The user may phrase their questions in various ways, but the core intent
-    should be mapped to one of the two predefined analytical questions below.
-    Do not rely on exact keyword matching — instead, identify the semantic
-    meaning behind the user's input.
+## Analytical intent recognition
 
-    ### Predefined Intents
+The user may phrase questions in different ways; map the underlying meaning to one of the two
+analytical intents below when applicable. Do not rely on exact keyword matching.
 
-    Intent 1 — Physical Structure vs. Price
-    Core meaning: The user wants to understand how measurable physical
-    attributes of a property (such as area, number of floors, bedrooms,
-    bathrooms, or frontage width) relate to or influence its selling price.
+### Predefined analytical intents
 
-    Intent 2 — Bigger = More Expensive?
-    Core meaning: The user wants to challenge or verify the assumption that
-    larger properties are always priced higher — looking for exceptions,
-    nuances, or non-linear relationships in the data.
+Intent 1 — Physical structure vs. price
+The user wants to understand how measurable physical attributes (area, floors, bedrooms,
+bathrooms, frontage) relate to or influence selling price.
 
-    ### Handling Ambiguous Input
-    If the user's message could reasonably map to either intent, or does
-    not clearly match either one, return analysis_intent='ambiguous' so the
-    assistant can ask a brief clarifying question.
+Intent 2 — Bigger = more expensive?
+The user wants to verify whether larger homes are always priced higher, including exceptions,
+nuances, or non-linear relationships.
 
-    Trả về format JSON duy nhất:
-    {{
-        "intent": "data_analysis" | "metadata_query" | "general_chat",
-        "graph_type": "scatter_2d_plot" | "box_plot" | "bar_plot" | "treemap_plot" | "none",
-        "target_col": "tên cột liên quan hoặc none",
-        "analysis_intent": "physical_structure_vs_price" | "bigger_equals_more_expensive" | "ambiguous" | "none"
-    }}
+### Ambiguous input
+If the message could map to either analytical intent or clearly matches neither, set
+analysis_intent to 'ambiguous' so the assistant can ask a short clarifying question.
 
-    Quy tắc chọn graph_type cho data_analysis:
-    - analysis_intent='physical_structure_vs_price' -> ưu tiên "scatter_2d_plot" (Area-Price),
-      hoặc "box_plot"/"bar_plot" nếu câu hỏi nhấn mạnh so sánh theo nhóm Floors/Bedrooms/Bathrooms/Frontage.
-    - analysis_intent='bigger_equals_more_expensive' -> ưu tiên "box_plot" (theo nhóm diện tích)
-      hoặc "scatter_2d_plot" để kiểm tra ngoại lệ.
-    - Nếu không phù hợp, dùng "none".
+Return exactly one JSON object with this shape:
+{{
+    "intent": "data_analysis" | "metadata_query" | "general_chat",
+    "graph_type": "scatter_2d_plot" | "box_plot" | "bar_plot" | "treemap_plot" | "none",
+    "target_col": "related column name or none",
+    "analysis_intent": "physical_structure_vs_price" | "bigger_equals_more_expensive" | "ambiguous" | "none"
+}}
 
-    Lịch sử: {history}
-    Câu hỏi: {question}
-    """
+Rules for graph_type when intent is data_analysis:
+- analysis_intent='physical_structure_vs_price' → prefer "scatter_2d_plot" (area vs price),
+  or "box_plot"/"bar_plot" if the question emphasizes comparison by floors/bedrooms/bathrooms/frontage.
+- analysis_intent='bigger_equals_more_expensive' → prefer "box_plot" by area groups,
+  or "scatter_2d_plot" to surface outliers.
+- Otherwise use "none".
+
+Conversation history:
+{history}
+
+User question:
+{question}
+"""
     try:
         import json
         import re
@@ -107,7 +139,7 @@ def classify_intent(llm: object, question: str, history: str) -> dict:
         match = re.search(r"\{.*\}", response, re.DOTALL)
         if match:
             return json.loads(match.group())
-    except:
+    except Exception:
         pass
     return {
         "intent": "data_analysis",
@@ -115,6 +147,91 @@ def classify_intent(llm: object, question: str, history: str) -> dict:
         "target_col": "none",
         "analysis_intent": "none",
     }
+
+
+def _graph_type_from_keywords(question_user: str) -> str | None:
+    """
+    Fast graph routing from phrasing — avoids an extra LLM round when confident.
+    More specific patterns are checked first.
+    """
+    q = question_user.lower()
+
+    if "sunburst" in q:
+        return "sunburst_plot"
+    if "treemap" in q:
+        return "treemap_plot"
+    if "violin" in q:
+        return "violin_plot"
+    if "ohlc" in q or "candlestick" in q:
+        return "candle_plot"
+    if "heatmap" in q or "ma trận tương quan" in q or "correlation matrix" in q:
+        return "heatmap"
+    if "bubble" in q:
+        return "bubble_plot"
+    if ("scatter" in q or "phân tán" in q) and ("3d" in q or "3-d" in q):
+        return "scatter_3d_plot"
+    if "surface" in q and ("3d" in q or "3-d" in q):
+        return "surface_plot"
+    if "density" in q and "contour" in q:
+        return "density_contour_plot"
+    if "polar" in q or "radar" in q or "nhện" in q:
+        return "polar_plot"
+    if "choropleth" in q:
+        return "choroplethmap_plot"
+    if "density" in q and "map" in q:
+        return "densitymap_plot"
+    if ("scatter" in q and "map" in q) or (
+        "bản đồ" in q and ("điểm" in q or "scatter" in q)
+    ):
+        return "scattermap_plot"
+
+    province_ranking_markers = [
+        "tỉnh nào",
+        "thành phố nào",
+        "province",
+        "xuất hiện nhiều nhất",
+        "nhiều nhất trong dataset",
+        "phân bổ theo tỉnh",
+        "top tỉnh",
+        "xếp hạng tỉnh",
+        "tỉnh nào nhiều",
+        "tỉnh nào ít",
+        "thành nào",
+    ]
+    if any(m in q for m in province_ranking_markers) and (
+        "bar" in q
+        or "cột" in q
+        or "biểu đồ" in q
+        or "vẽ" in q
+        or "đồ thị" in q
+        or "nhất" in q
+        or "rank" in q
+    ):
+        return "bar_plot"
+
+    if "pie" in q or "tròn" in q or "tỉ lệ %" in q:
+        return "pie_plot"
+    if "box" in q or "hộp" in q or "quartile" in q or "tứ phân vị" in q:
+        return "box_plot"
+    if "histogram" in q or "hist" in q or ("phân phối" in q and "tần suất" in q):
+        return "histogram_plot"
+    if "line" in q or (
+        "đường" in q
+        and ("xu hướng" in q or "trend" in q or "theo thời gian" in q)
+    ):
+        return "line_plot"
+    if "area chart" in q or ("area" in q and ("chart" in q or "đồ thị" in q or "biểu đồ" in q)):
+        return "area_plot"
+    if "bar" in q or "cột" in q or "bar chart" in q:
+        return "bar_plot"
+    if "scatter" in q or "phân tán" in q:
+        return "scatter_2d_plot"
+    if "table_plotly" in q or ("plotly" in q and "table" in q):
+        return "table_plotly"
+    if ("dataframe" in q and "table" in q) or ("bảng" in q and "dữ liệu" in q):
+        return "table"
+
+    return None
 
 
 def define_graph_type(llm: object, question_user: str, hist_questions: str) -> str:
@@ -136,31 +253,51 @@ def define_graph_type(llm: object, question_user: str, hist_questions: str) -> s
     ):
         return "scatter_2d_plot"
 
-    # Hàm này giờ gọi classify_intent để lấy graph_type
+    keyword_graph = _graph_type_from_keywords(question_user)
+    if keyword_graph is not None:
+        return keyword_graph
+
     res = classify_intent(llm, question_user, hist_questions)
     analysis_intent = res.get("analysis_intent", "none")
     graph_type = res.get("graph_type", "none")
 
     if analysis_intent == "physical_structure_vs_price":
-        if any(k in q for k in ["số tầng", "tầng", "phòng ngủ", "phòng tắm", "mặt tiền", "frontage"]):
+        if any(
+            k in q
+            for k in [
+                "số tầng",
+                "tầng",
+                "phòng ngủ",
+                "phòng tắm",
+                "mặt tiền",
+                "frontage",
+            ]
+        ):
             return "box_plot"
         return "scatter_2d_plot"
 
     if analysis_intent == "bigger_equals_more_expensive":
-        if any(k in q for k in ["luôn", "always", "ngoại lệ", "exception", "không phải lúc nào"]):
+        if any(
+            k in q
+            for k in [
+                "luôn",
+                "always",
+                "ngoại lệ",
+                "exception",
+                "không phải lúc nào",
+            ]
+        ):
             return "box_plot"
         return "scatter_2d_plot"
 
     return graph_type
 
 
-# Old function header replaced by new logic below
 def _deprecated_define_graph_type(
     llm: object, question_user: str, hist_questions: str
 ) -> str:
     """
-    Phân tích câu hỏi qua LLM và xác định loại biểu đồ cho RAG routing.
-    Mở rộng nhận diện câu hỏi về tỉnh/thành, xuất hiện nhiều nhất, xếp hạng.
+    Legacy LLM router for graph type (RAG routing). Kept for reference; prefer define_graph_type().
     """
 
     prompt_template = f"""
@@ -169,68 +306,63 @@ def _deprecated_define_graph_type(
     {question_user}
     Answer with just one word.
     </question>
-    
+
     <hist_questions>
     {hist_questions}
     </hist_questions>
 
-    Analyze the question within the <question> tags and determine which type of graph is most appropriate for 
+    Analyze the question within the <question> tags and determine which type of graph is most appropriate for
     the question, according to the options listed in <allowed_words>.
-    
+
     Analyze message history within the <hist_questions> tags for more context in response.
 
     <allowed_words>
-    answer "treemap_plot" if has in question (treemap, biểu đồ treemap)
-    answer "sunburst_plot" if has in question (sunburst, biểu đồ tròn phân cấp)
-    answer "density_contour_plot" if has in question (density contour, đường đồng mức mật độ, contour mật độ)
-    answer "violin_plot" if has in question (violin, biểu đồ violin, đàn violin)
-    answer "candle_plot" if has in question (candle, nến, ohlc, candlestick, nến nhật)
-    answer "heatmap" if has in question (heatmap, bản đồ nhiệt, ma trận tương quan, matrix)
-    answer "scatter_2d_plot" if has in question (scatter, điểm phân tán, biểu đồ điểm)
-    answer "bubble_plot" if has in question (bubble, bong bóng, biểu đồ bong bóng)
-    answer "scatter_3d_plot" if has in question (scatter 3d, điểm 3d, biểu đồ 3 chiều)
-    answer "surface_plot" if has in question (surface, bề mặt, biểu đồ bề mặt, 3d surface)
-    answer "bar_plot" if has in question (bar, cột, biểu đồ cột, biểu đồ thanh)
-                     OR if the question asks about province/city frequency or ranking, like:
-                     "tỉnh nào xuất hiện nhiều nhất", "tỉnh nào có nhiều nhất", "thành phố nào nhiều nhất",
-                     "tỉnh nào ít nhất", "phân bổ theo tỉnh", "bao nhiêu bất động sản ở mỗi tỉnh",
-                     "top tỉnh thành", "xếp hạng tỉnh", "province nào", "cái nào nhiều nhất/ít nhất",
-                     "tỉnh/thành nào chiếm nhiều nhất/ít nhất", "xếp hạng", "top", "so sánh",
-                     "cao nhất", "thấp nhất", "nhiều nhất", "ít nhất", "loại nào", "khu vực nào",
-                     "nơi nào", "which ... is the highest/most/least/lowest/top/bottom"
-    answer "line_plot" if has in question (line, đường, biểu đồ đường, xu hướng, theo thời gian)
-    answer "histogram_plot" if has in question (histogram, phân phối, tần suất, tần số, phân bố)
-    answer "pie_plot" if has in question (pie, tròn, biểu đồ tròn, tỷ lệ phần trăm, cơ cấu)
-    answer "box_plot" if has in question (box, hộp, biểu đồ hộp, tứ phân vị, box plot)
-    answer "area_plot" if has in question (area, diện tích, biểu đồ vùng, miền)
-    answer "choroplethmap_plot" if has in question (bản đồ choropleth, bản đồ tô màu, choropleth)
-    answer "densitymap_plot" if has in question (bản đồ mật độ, density map)
-    answer "scattermap_plot" if has in question (bản đồ điểm, scatter map, điểm trên bản đồ)
-    answer "polar_plot" if has in question (radar, polar, biểu đồ radar, biểu đồ nhện, mạng nhện)
-    answer "table" if has in question (bảng dataframe, bảng dữ liệu, hiển thị bảng)
-    answer "table_plotly" if has in question (bảng plotly, bảng đồ họa, table plotly)
+    answer "treemap_plot" if has in question (treemap, or Vietnamese "biểu đồ treemap")
+    answer "sunburst_plot" if has in question (sunburst, or Vietnamese layered pie chart phrasing)
+    answer "density_contour_plot" if has in question (density contour, contour plot phrasing)
+    answer "violin_plot" if has in question (violin plot phrasing in EN or VN)
+    answer "candle_plot" if has in question (candle, OHLC, candlestick)
+    answer "heatmap" if has in question (heatmap, correlation matrix phrasing in EN or VN)
+    answer "scatter_2d_plot" if has in question (scatter, scatter plot phrasing in EN or VN)
+    answer "bubble_plot" if has in question (bubble chart phrasing in EN or VN)
+    answer "scatter_3d_plot" if has in question (scatter 3d phrasing)
+    answer "surface_plot" if has in question (3d surface phrasing)
+    answer "bar_plot" if has in question (bar chart phrasing in EN or VN)
+                     OR if the question asks about province/city frequency or ranking, e.g. Vietnamese:
+                     which province appears most/least, distribution by province, top provinces, ranking.
+    answer "line_plot" if has in question (line chart, trend over time phrasing)
+    answer "histogram_plot" if has in question (histogram, distribution, frequency phrasing)
+    answer "pie_plot" if has in question (pie chart, percentage breakdown phrasing)
+    answer "box_plot" if has in question (box plot, quartile phrasing)
+    answer "area_plot" if has in question (area chart phrasing; not the column "Area" alone)
+    answer "choroplethmap_plot" if has in question (choropleth map phrasing)
+    answer "densitymap_plot" if has in question (density map phrasing)
+    answer "scattermap_plot" if has in question (scatter map / points on map phrasing)
+    answer "polar_plot" if has in question (radar / polar / spider chart phrasing)
+    answer "table" if has in question (dataframe table, show as table phrasing)
+    answer "table_plotly" if has in question (plotly table phrasing)
     answer "base_ref" if there is nothing related to the question.
     </allowed_words>
 
     Use context information for accuracy in the answer.
     DECLARE ONLY one WORD in response according with <allowed_words> tags.
-    
+
     Response examples:
-    question: 'vẽ biểu đồ cột theo tỉnh thành' 
+    question: 'vẽ biểu đồ cột theo tỉnh thành'
     response: 'bar_plot'
-    
+
     question: 'tỉnh nào xuất hiện nhiều nhất trong dataset?'
     response: 'bar_plot'
-    
-    question: 'tỉnh nào có nhiều bất động sản nhất?' 
+
+    question: 'tỉnh nào có nhiều bất động sản nhất?'
     response: 'bar_plot'
 
     question: 'thống kê số lượng bất động sản theo từng tỉnh'
     response: 'bar_plot'
-    
+
     question: 'phân phối giá nhà theo histogram'
     response: 'histogram_plot'
-    
+
     """
 
     response = llm.invoke(prompt_template)
@@ -241,15 +373,15 @@ def process_prompt(
     session_msgs: list[dict], user_question: str, data: dict, llm: object
 ) -> str:
     """
-    Xử lý, RAG routing và tạo final prompt.
-    [NEW] Luôn chạy thêm semantic RAG từ rag_docs/ và inject <rag_docs_context>.
+    Build metadata, RAG routing, semantic RAG from rag_docs/, and the final code-generation prompt.
     """
 
-    # ── Process data for prompt <metadata> ────────────────────────────────────
+    last_df = None
     try:
         output_parts = []
         context_parts = []
         for index, (name, df) in enumerate(data.items(), start=1):
+            last_df = df
             buffer = StringIO()
             df.info(buf=buffer)
             df_info = buffer.getvalue()
@@ -272,10 +404,10 @@ def process_prompt(
         track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
         message_ = "WARNING! Sample data error, provided only columns as samples"
         st.error(f"{message_}  <{exception_name}: {track_line}>")
-        metadata = str(df.columns)
+        cols = list(last_df.columns) if last_df is not None else []
+        metadata = str(cols)
         data_context = f"columns_only={metadata}"
 
-    # ── Code in context ────────────────────────────────────────────────────────
     if st.session_state["context_code_var"]:
         st.session_state["context_code_var"] = False
         context_code = st.session_state["last_code"]
@@ -285,22 +417,9 @@ def process_prompt(
     user_questions = [item for item in session_msgs if item["role"] == "user"]
     questions_text = "\n".join([item["question"] for item in user_questions])
 
-    # ── RAG routing (ragdata/ - poor man's RAG, giữ nguyên) ───────────────────
     graph_type = define_graph_type(llm, user_question, questions_text)
-    dir_path = "./ragdata"
-    files = os.listdir("./ragdata")
-    for file_ in files:
-        file_name, file_ext = os.path.splitext(file_)
-        if file_name == graph_type and file_ext == ".txt":
-            file_path = os.path.join(dir_path, file_)
-            with open(file_path, "r") as code:
-                params_plot = f"\n\n<code_ref>\n{code.read()}\n</code_ref>"
-            break
-        else:
-            with open("ragdata/base_ref.txt") as code:
-                params_plot = f"\n\n<code_ref>\n{code.read()}\n</code_ref>"
+    params_plot = _load_ragdata_code_ref(graph_type)
 
-    # ── [NEW] Semantic RAG từ rag_docs/ ───────────────────────────────────────
     try:
         rag_docs_context = build_rag_context(
             user_question, top_k=3, min_similarity=0.25
@@ -316,7 +435,6 @@ def process_prompt(
     except Exception as e:
         rag_docs_context = ""
         print(f"\n{Fore.LIGHTRED_EX}[RAGDocs] Error: {e}{Fore.RESET}")
-    # ─────────────────────────────────────────────────────────────────────────
 
     price_driver_keywords = [
         "ảnh hưởng",
@@ -335,7 +453,6 @@ def process_prompt(
         "giá" in q_lower or "price" in q_lower
     )
 
-    # ── Xác định loại kết quả trả về ──────────────────────────────────────────
     if graph_type in [
         "scatter_2d_plot",
         "bubble_plot",
@@ -367,10 +484,6 @@ def process_prompt(
 # - Set `result = {"figure": fig, "analysis": analysis}`.
 # Do NOT set `result` to only the figure.
 """
-        lang_code = st.session_state.get("lang_var", "en")
-        lang_for_text = "Vietnamese" if lang_code == "vi" else lang_code
-
-        # ── [PROVINCE RANKING] Inject thêm hướng dẫn khi câu hỏi về tỉnh ────
         province_hint = ""
         province_keywords = [
             "tỉnh nào",
@@ -385,14 +498,14 @@ def process_prompt(
         if any(kw in user_question.lower() for kw in province_keywords):
             province_hint = """
         # PROVINCE RANKING HINT:
-        # Câu hỏi này liên quan đến đếm số lượng bất động sản theo tỉnh/thành.
-        # Cột cần dùng: 'Province' (tên tỉnh/thành phố).
-        # Công thức chuẩn:
+        # The question is about counting listings by province/city.
+        # Use column 'Province' (province or city name).
+        # Standard pattern:
         #   province_counts = df['Province'].value_counts().reset_index()
         #   province_counts.columns = ['Province', 'Count']
         #   province_counts['Percentage'] = (province_counts['Count'] / len(df) * 100).round(2)
-        # Vẽ bar chart ngang (orientation='h') sắp xếp từ cao xuống thấp.
-        # Hiển thị text count trên từng bar.
+        # Prefer a horizontal bar chart (orientation='h') sorted high to low.
+        # Show count labels on each bar. Use Vietnamese labels for the chart.
 """
 
         price_driver_hint = ""
@@ -400,78 +513,65 @@ def process_prompt(
         if is_price_driver_question:
             price_driver_hint = """
         # PRICE DRIVER HINT:
-        # Câu hỏi này yêu cầu phân tích mức độ ảnh hưởng của diện tích/cấu trúc đến giá.
-        # Bắt buộc nêu bằng chứng định lượng, ngoại lệ và kết luận có điều kiện.
-        # Không khẳng định quan hệ nhân quả tuyệt đối, phải ghi rõ 'tương quan không đồng nghĩa nhân quả'.
-        # Ưu tiên scatter (Area-Price) + so sánh nhóm theo Floors/Bedrooms/Bathrooms/Frontage.
+        # The question asks how area/structure relates to price.
+        # You MUST give quantitative evidence, cite exceptions, and state a conditional conclusion.
+        # Do not claim absolute causality; explicitly note that correlation is not causation (in Vietnamese in `analysis`).
+        # Prefer scatter (area vs price) plus group comparisons by Floors/Bedrooms/Bathrooms/Frontage.
 """
             intent_hint = """
         # INTENT RECOGNITION:
-        # Map câu hỏi theo nghĩa ngữ nghĩa về 2 intent:
-        # (1) Physical Structure vs. Price
-        # (2) Bigger = More Expensive?
-        # Nếu mơ hồ giữa 2 intent, phải hỏi rõ người dùng trước khi kết luận.
+        # Map the question semantically to one of two intents:
+        # (1) Physical structure vs. price
+        # (2) Bigger = more expensive?
+        # If ambiguous between the two, ask the user a clarifying question before drawing a firm conclusion.
         #
         # CHART SELECTION GUIDELINES:
         # - Intent 1:
-        #   + Scatter 2D (Area vs Price) để thấy xu hướng liên tục.
-        #   + Box/Bar theo Floors/Bedrooms/Bathrooms/Frontage để so sánh nhóm cấu trúc.
+        #   + Scatter 2D (area vs price) for continuous trend.
+        #   + Box/bar by Floors/Bedrooms/Bathrooms/Frontage for structural group comparison.
         # - Intent 2:
-        #   + Box plot theo nhóm diện tích để kiểm tra vùng chồng lấn giá giữa nhà nhỏ/lớn.
-        #   + Scatter 2D để chỉ ra các ngoại lệ (nhà nhỏ đắt hơn nhà lớn).
-        # Không dùng 1 biểu đồ duy nhất để kết luận tuyệt đối khi có ngoại lệ.
+        #   + Box plot by area buckets to show price overlap between smaller vs larger homes.
+        #   + Scatter 2D to highlight exceptions (small expensive vs large cheap).
+        # Do not use a single chart alone for an absolute conclusion when exceptions exist.
 """
 
         prompt_context = f"""
         {province_hint}
         {price_driver_hint}
         {intent_hint}
-        For plots, ONLY use the "Plotly" library and bring fig object into the result variable.
-        The template should ONLY be "plotly", when not requested.
-        All texts in titles, axis titles, legends, hovers, etc., SET to language "{lang_for_text}".
-        SET Legend title according to legend data, when not requested.
-        On the x and y axes, place large words or numbers representing dates at 45 degrees, when not requested.
-        The title color must follow the template standard, when not requested.
-        DEFINE text in "xaxis_title" or "yaxis_title" according to <main_question>, removing symbols and special characters.
-        DECLARE the chart title according to <main_question>.
-        Follow the underlying tags below EXACTLY, ALWAYS guided by the <main_question> tag.
-        SET the update_traces() and update_layout() configs BASED in context within the <code_ref> tags for <main_question>.
+        For plots, ONLY use the Plotly library and assign the figure to the result contract above.
+        Default template style: plotly, unless the user requests otherwise.
+        All visible text in titles, axis titles, legends, hovers, etc., MUST be in Vietnamese.
+        Set the legend title from the data when not specified by the user.
+        On the x and y axes, rotate long date or category labels to about 45 degrees when it improves readability.
+        Title color should follow the template defaults unless the user requests otherwise.
+        Derive "xaxis_title" and "yaxis_title" text from <main_question>, stripping odd symbols where sensible.
+        Derive the chart title from <main_question>.
+        Follow the blocks below exactly, always driven by <main_question>.
+        Apply update_traces() and update_layout() using patterns in <code_ref> as a baseline for <main_question>.
         {params_plot}"""
-
     elif graph_type == "table":
         result_instruction = """
 # For table requests:
 # - Return ONLY a pandas dataframe in `result`.
 """
         prompt_context = """
-        Any table or list request by the <main_question> tag, the response must ONLY be a return with
-        dataframe and NEVER a graph.
+        For any table or list request in <main_question>, return ONLY a dataframe in `result` and NEVER a graph.
         """
     else:
         result_instruction = """
 # For non-plot requests:
 # - Set `result` to the final answer text (string) in Vietnamese.
 """
-        with open("ragdata/base_ref.txt") as code:
-            params_plot = f"\n\n<code_ref>\n{code.read()}\n</code_ref>"
         prompt_context = f"""
-        For plots, ONLY use the "Plotly" library and bring fig object into the result variable.
+        For plots, ONLY use the Plotly library and assign the figure into the result variable per contract above.
         {params_plot}"""
 
     print(f"\n\n{Fore.LIGHTGREEN_EX}STARTING RUNTIME...{Fore.RESET}")
     print(f"\n{Fore.LIGHTBLUE_EX}GRAPH TYPE BASE:{Fore.RESET} {graph_type}")
 
-    # ── Language instruction ───────────────────────────────────────────────────
-    if st.session_state["lang_var"] == "en":
-        lang = "Respond ONLY in <en> language. Configure all graphics parameters for the <en> language."
-    elif st.session_state["lang_var"] == "pt-BR":
-        lang = "Respond ONLY in <pt-BR> language. Configure all graphics parameters for the <pt-BR> language."
-    else:
-        lang = "Respond ONLY in Vietnamese language. Configure all graphics parameters for Vietnamese language."
-
-    # ── Final prompt (rag_docs_context inject ngay sau metadata) ──────────────
     prompt_main = f"""
-    
+
         <metadata>
         {metadata}
         </metadata>
@@ -481,41 +581,41 @@ def process_prompt(
         {rag_docs_context}
         {STRICT_PROMPT_RULES}
         {SELF_CHECK_INSTRUCTIONS}
-        
-        DEFINE DF_* according to the <main_question> using the variables already declared <DF_1, DF_2, DF_*, ...>. 
-        A priori assumes DF as DF_1.
-        
+
+        Map dataframes to DF_* names according to <main_question>, using variables already declared as <DF_1, DF_2, ...>.
+        Unless the question specifies otherwise, treat the primary dataframe as DF_1.
+
         ```python
         # TODO: import the necessary dependencies.
-        import pandas as pd 
+        import pandas as pd
         import plotly.express as px
         import plotly.graph_objects as go
         ...
-            
+
         df = pd.DataFrame(DF_*)
-            
+
         # Complete your code here.
         ...
-        
-        # bring the result here.
+
+        # Assign the final payload here.
         {result_instruction}
         result = None
         ```
-    
-    
-        Answer the <main_question> tag concisely and accurately. For greater accuracy in your answers, follow the context EXACTLY
-        provided by the <guidelines> and <last_code> tags, always driven by the <main_question> tag request and the data
-        in the <metadata> tag. Answers with numbers ONLY with two decimal places. In case of error, DEBUG the code according to
-        <message_error> tag and the wrong code tag <code_error>.
-        {"For price-driver questions, your final analysis MUST include: (1) quantified evidence, (2) at least one exception/counter-example, (3) a conditional conclusion that avoids absolute causality claims." if is_price_driver_question else ""}
-                    
-                        
+
+
+        Answer <main_question> concisely and accurately. Follow <guidelines> and <last_code> only as supporting context;
+        the request in <main_question> and the tables in <metadata> are authoritative.
+        Format numeric values in natural-language summaries with at most two decimal places unless an integer is clearer.
+        On execution errors, debug using <message_error> and the broken code in <code_error>.
+        {"For price-driver questions, the final `analysis` (and any string `result`) MUST include: (1) quantitative evidence, (2) at least one exception or counter-example, (3) a conditional conclusion that avoids absolute causality claims — all in Vietnamese." if is_price_driver_question else ""}
+
+
         <guidelines>
-        Follow the guidelines below and use the <messages_history> and <last_code> tags to improve understanding only as context:        
+        Follow the guidelines below. Use <messages_history> and <last_code> only for context, not as overrides:
         {prompt_context}
         </guidelines>
-            
-            
+
+
         <messages_history>
         {questions_text}
         </messages_history>
@@ -524,22 +624,22 @@ def process_prompt(
         <main_question>
         {user_question}
         </main_question>
-        
-        
+
+
         <last_code>
         ```python
         {context_code}
         ```
         </last_code>
-        
+
 
 
         Variable `GEOJSON: list[dict]` is already declared.
 
-        Generate python code and return full updated code.
-        
-        {lang}
-        
+        Generate complete Python code and return the full updated code in a single fenced ```python block.
+
+        {VIETNAMESE_USER_FACING_OUTPUT}
+
         """
 
     return prompt_main

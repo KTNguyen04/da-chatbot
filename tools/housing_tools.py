@@ -1,12 +1,12 @@
 # tools/housing_tools.py
 """
-Tool phân tích dataset bất động sản Việt Nam.
+Analysis tools for the Vietnam housing dataset.
 
-Mỗi tool gồm:
-  - Schema (TOOL_DEFINITIONS): mô tả cho LLM biết khi nào và cách gọi tool
-  - Implementation (TOOL_FUNCTIONS): hàm Python thực sự xử lý dữ liệu
+Each tool exposes:
+  - TOOL_DEFINITIONS: English schema text for the LLM (when to call, how arguments work)
+  - TOOL_FUNCTIONS: Python implementations (numeric summaries; user-facing prose still Vietnamese via the chat model)
 
-Columns trong dataset:
+Dataset columns include:
   Address, Area, Frontage, Access Road, House direction, Balcony direction,
   Floors, Bedrooms, Bathrooms, Legal status, Furniture state, Price, Project,
   Ward_Street, District, Province, Price_per_m2, Is_Project, Area_group, Has_certificate
@@ -16,50 +16,49 @@ import pandas as pd
 import numpy as np
 from typing import Any, Optional, List
 
-# ── Tham chiếu DataFrame – sẽ được inject bởi tool_executor ──────────────────
+# ── DataFrame reference (injected by tool_executor) ─────────────────────────
 _df: Optional[pd.DataFrame] = None
 
 
 def set_dataframe(df: pd.DataFrame) -> None:
-    """Được gọi bởi tool_executor trước khi thực thi bất kỳ tool nào."""
+    """Called by tool_executor before any tool runs."""
     global _df
     _df = df
 
 
 def _require_df() -> pd.DataFrame:
     if _df is None:
-        raise RuntimeError("DataFrame chưa được khởi tạo. Gọi set_dataframe() trước.")
+        raise RuntimeError("DataFrame not initialized; call set_dataframe() first.")
     return _df
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TOOL SCHEMAS (chuẩn OpenAI/Ollama function-calling)
+# TOOL SCHEMAS (OpenAI / Ollama function-calling; descriptions in English)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TOOL_DEFINITIONS: list[dict] = [
 
-    # ── 1. Xếp hạng tỉnh/thành theo số lượng bất động sản ────────────────────
+    # ── 1. Province / city ranking by listing count ────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "get_province_ranking",
             "description": (
-                "Xếp hạng tỉnh/thành phố theo số lượng bất động sản trong dataset. "
-                "Dùng khi hỏi: 'tỉnh nào xuất hiện nhiều nhất', 'tỉnh nào có nhiều bất động sản nhất', "
-                "'thành phố nào nhiều nhà nhất', 'phân bổ bất động sản theo tỉnh', "
-                "'bao nhiêu bất động sản ở mỗi tỉnh', 'top tỉnh thành', 'tỉnh nào ít nhất'."
+                "Rank provinces or cities by how many listings appear in the dataset. "
+                "Use when the user asks (possibly in Vietnamese) which province appears most/least, "
+                "distribution by province, top provinces, counts per province, etc."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "top_n": {
                         "type": "integer",
-                        "description": "Số tỉnh/thành hiển thị (mặc định 15, tối đa toàn bộ)",
+                        "description": "How many provinces/cities to return (default 15; use a large value for all)",
                         "default": 15
                     },
                     "ascending": {
                         "type": "boolean",
-                        "description": "True = ít nhất trước, False = nhiều nhất trước (mặc định False)",
+                        "description": "True = smallest counts first, False = largest first (default False)",
                         "default": False
                     }
                 },
@@ -68,22 +67,22 @@ TOOL_DEFINITIONS: list[dict] = [
         }
     },
 
-    # ── 2. Thống kê mô tả cột số ──────────────────────────────────────────────
+    # ── 2. Descriptive statistics for a numeric column ─────────────────────────
     {
         "type": "function",
         "function": {
             "name": "describe_numeric_column",
             "description": (
-                "Tính toán thống kê mô tả (min, max, mean, median, std, percentiles) "
-                "cho một cột số trong dataset. Dùng khi hỏi về 'thống kê', 'trung bình', "
-                "'giá trị nhỏ nhất/lớn nhất', 'phân phối', 'khoảng giá', 'độ lệch chuẩn'."
+                "Compute descriptive statistics (min, max, mean, median, std, percentiles) "
+                "for one numeric column. Use when the user asks for summary stats, averages, spread, "
+                "or distribution of a numeric field (questions may be phrased in Vietnamese)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "column": {
                         "type": "string",
-                        "description": "Tên cột số cần thống kê (ví dụ: 'Price', 'Area', 'Bedrooms')"
+                        "description": "Numeric column name (e.g. 'Price', 'Area', 'Bedrooms')"
                     }
                 },
                 "required": ["column"]
@@ -91,37 +90,36 @@ TOOL_DEFINITIONS: list[dict] = [
         }
     },
 
-    # ── 3. So sánh giá trị trung bình theo nhóm ──────────────────────────────
+    # ── 3. Aggregate a numeric column by a categorical group ───────────────────
     {
         "type": "function",
         "function": {
             "name": "compare_mean_by_group",
             "description": (
-                "So sánh giá trị trung bình (hoặc tổng/median) của một cột số "
-                "được nhóm theo một cột phân loại. Ví dụ: giá trung bình theo tỉnh, "
-                "diện tích trung bình theo số phòng ngủ. Dùng khi hỏi 'so sánh giá theo ...', "
-                "'trung bình ... theo từng ...', 'tỉnh nào có giá cao nhất', 'giá/m2 theo quận'."
+                "Aggregate a numeric column by a categorical column (mean/median/sum/count/min/max). "
+                "Examples: mean price by province, mean area by bedroom count, price per m² by district. "
+                "User wording may be Vietnamese (e.g. comparing price across groups)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "value_column": {
                         "type": "string",
-                        "description": "Cột số cần tính toán (ví dụ: 'Price', 'Area', 'Price_per_m2')"
+                        "description": "Numeric column to aggregate (e.g. 'Price', 'Area', 'Price_per_m2')"
                     },
                     "group_column": {
                         "type": "string",
-                        "description": "Cột phân loại để nhóm (ví dụ: 'Province', 'District', 'Legal status')"
+                        "description": "Categorical column to group by (e.g. 'Province', 'District', 'Legal status')"
                     },
                     "agg_func": {
                         "type": "string",
                         "enum": ["mean", "median", "sum", "count", "min", "max"],
-                        "description": "Hàm tổng hợp: mean/median/sum/count/min/max (mặc định: mean)",
+                        "description": "Aggregation function (default: mean)",
                         "default": "mean"
                     },
                     "top_n": {
                         "type": "integer",
-                        "description": "Giới hạn top N nhóm theo giá trị (mặc định 15)",
+                        "description": "Return only the top N groups by aggregated value (default 15)",
                         "default": 15
                     }
                 },
@@ -130,26 +128,26 @@ TOOL_DEFINITIONS: list[dict] = [
         }
     },
 
-    # ── 4. Đếm và tỷ lệ theo nhóm ─────────────────────────────────────────────
+    # ── 4. Counts and shares by category ───────────────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "count_by_category",
             "description": (
-                "Đếm số lượng và tính tỷ lệ phần trăm của từng giá trị trong một cột phân loại. "
-                "Dùng khi hỏi 'cơ cấu theo loại pháp lý', 'tỷ lệ % theo tình trạng nội thất', "
-                "'phân bổ theo hướng nhà', 'có bao nhiêu loại', 'cơ cấu theo ...'."
+                "Count rows and percentage share for each value of a categorical column. "
+                "Use for composition / mix questions (legal status mix, furniture mix, direction mix, etc.); "
+                "user questions may be Vietnamese."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "column": {
                         "type": "string",
-                        "description": "Tên cột phân loại cần đếm (ví dụ: 'Legal status', 'Furniture state', 'House direction')"
+                        "description": "Categorical column to count (e.g. 'Legal status', 'Furniture state', 'House direction')"
                     },
                     "top_n": {
                         "type": "integer",
-                        "description": "Chỉ lấy top N nhóm nhiều nhất (0 = lấy tất cả, mặc định 20)",
+                        "description": "Keep only the top N most frequent groups (0 = all groups; default 20)",
                         "default": 20
                     }
                 },
@@ -158,30 +156,30 @@ TOOL_DEFINITIONS: list[dict] = [
         }
     },
 
-    # ── 5. Lọc và thống kê theo điều kiện ────────────────────────────────────
+    # ── 5. Filter rows then summarize a numeric column ──────────────────────────
     {
         "type": "function",
         "function": {
             "name": "filter_and_summarize",
             "description": (
-                "Lọc dữ liệu theo một điều kiện cụ thể rồi tính thống kê tóm tắt. "
-                "Dùng khi hỏi 'giá trung bình của nhà 3 phòng ngủ ở Hà Nội', "
-                "'thống kê nhà có sổ hồng', 'lọc theo tỉnh/loại/pháp lý cụ thể'."
+                "Filter rows by one equality condition, then compute summary stats on a numeric column. "
+                "Use for questions like average price for 3-bedroom homes in a given province, "
+                "or stats after filtering by certificate / legal status (Vietnamese phrasing is common)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filter_column": {
                         "type": "string",
-                        "description": "Cột dùng để lọc (ví dụ: 'Province', 'Bedrooms', 'Has_certificate')"
+                        "description": "Column used to filter (e.g. 'Province', 'Bedrooms', 'Has_certificate')"
                     },
                     "filter_value": {
-                        "description": "Giá trị lọc (string hoặc số)",
+                        "description": "Filter value (string or number)",
                         "oneOf": [{"type": "string"}, {"type": "number"}]
                     },
                     "stat_column": {
                         "type": "string",
-                        "description": "Cột số cần tính thống kê sau khi lọc (ví dụ: 'Price', 'Area')"
+                        "description": "Numeric column to summarize after filtering (e.g. 'Price', 'Area')"
                     }
                 },
                 "required": ["filter_column", "filter_value", "stat_column"]
@@ -189,52 +187,52 @@ TOOL_DEFINITIONS: list[dict] = [
         }
     },
 
-    # ── 6. Phát hiện outlier ──────────────────────────────────────────────────
+    # ── 6. Outlier detection (IQR) ─────────────────────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "detect_outliers",
             "description": (
-                "Phát hiện các giá trị ngoại lệ (outlier) trong một cột số bằng phương pháp IQR. "
-                "Dùng khi hỏi 'outlier', 'giá bất thường', 'ngoại lệ', "
-                "'giá cao bất thường', 'dữ liệu lệch', 'bất động sản có giá bất thường'."
+                "Detect outliers in a numeric column using the IQR rule. "
+                "Use when the user asks about unusual prices, extreme values, or skewed tails "
+                "(often expressed in Vietnamese)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "column": {
                         "type": "string",
-                        "description": "Tên cột số cần phát hiện outlier (ví dụ: 'Price', 'Area', 'Price_per_m2')"
+                        "description": "Numeric column to scan (e.g. 'Price', 'Area', 'Price_per_m2')"
                     }
                 },
                 "required": ["column"]
             }
         }
     },
-    # ── 7. Phân tích biến ảnh hưởng giá (price drivers) ───────────────────────
+    # ── 7. Price drivers (correlation-style signals) ────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "analyze_price_drivers",
             "description": (
-                "Phân tích mức độ liên quan giữa giá bán và nhóm đặc trưng vật lý "
-                "(diện tích, số tầng, phòng ngủ, phòng tắm, mặt tiền). "
-                "Dùng cho câu hỏi: 'yếu tố nào ảnh hưởng giá', 'nhà to hơn có đắt hơn không'."
+                "Summarize how strongly price relates to structural numeric features "
+                "(area, floors, bedrooms, bathrooms, frontage). "
+                "Use for broad 'what drives price' or 'bigger house more expensive' style questions."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_column": {
                         "type": "string",
-                        "description": "Cột mục tiêu giá (mặc định: Price)",
+                        "description": "Target price column (default: Price)",
                         "default": "Price",
                     },
                     "feature_columns": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Danh sách cột đặc trưng cần phân tích. "
-                            "Mặc định: [Area, Floors, Bedrooms, Bathrooms, Frontage]"
+                            "Feature columns to analyze "
+                            "(default: Area, Floors, Bedrooms, Bathrooms, Frontage)"
                         ),
                     },
                 },
@@ -242,31 +240,31 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
-    # ── 8. Tóm tắt quan hệ diện tích và giá theo bins ─────────────────────────
+    # ── 8. Price vs size by quantile buckets ───────────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "price_vs_size_summary",
             "description": (
-                "Phân nhóm diện tích theo quantile và tính median/mean giá theo từng nhóm. "
-                "Dùng để trả lời 'nhà to hơn có luôn đắt hơn không'."
+                "Bin area into quantile groups and report mean/median price per bin. "
+                "Use to answer whether larger homes are always more expensive (overlap and monotonicity)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "area_column": {
                         "type": "string",
-                        "description": "Tên cột diện tích (mặc định: Area)",
+                        "description": "Area column name (default: Area)",
                         "default": "Area",
                     },
                     "price_column": {
                         "type": "string",
-                        "description": "Tên cột giá (mặc định: Price)",
+                        "description": "Price column name (default: Price)",
                         "default": "Price",
                     },
                     "bins": {
                         "type": "integer",
-                        "description": "Số nhóm quantile (mặc định 5)",
+                        "description": "Number of quantile buckets (default 5)",
                         "default": 5,
                     },
                 },
@@ -274,14 +272,14 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
-    # ── 9. So sánh giá theo nhóm cấu trúc vật lý ──────────────────────────────
+    # ── 9. Price by structural groups ──────────────────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "structure_group_price_compare",
             "description": (
-                "So sánh giá theo từng nhóm cấu trúc (Floors, Bedrooms, Bathrooms, Frontage...). "
-                "Trả median/mean giá theo nhóm để rút insight ảnh hưởng cấu trúc đến giá."
+                "Compare price across structural groups (floors, bedrooms, bathrooms, frontage buckets). "
+                "Returns group-level medians/means to support structure-vs-price narratives."
             ),
             "parameters": {
                 "type": "object",
@@ -290,18 +288,18 @@ TOOL_DEFINITIONS: list[dict] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Các cột nhóm cấu trúc cần so sánh. "
-                            "Mặc định: [Floors, Bedrooms, Bathrooms]"
+                            "Structural columns to compare "
+                            "(default: Floors, Bedrooms, Bathrooms)"
                         ),
                     },
                     "price_column": {
                         "type": "string",
-                        "description": "Tên cột giá (mặc định: Price)",
+                        "description": "Price column name (default: Price)",
                         "default": "Price",
                     },
                     "top_n": {
                         "type": "integer",
-                        "description": "Số nhóm tối đa mỗi cột để trả về",
+                        "description": "Max groups to return per column",
                         "default": 10,
                     },
                 },
@@ -309,22 +307,21 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
-    # ── 10. Phân tích intent 1: kích thước/cấu trúc vs giá ───────────────────
+    # ── 10. Intent bundle: physical structure vs price ─────────────────────────
     {
         "type": "function",
         "function": {
             "name": "analyze_property_structure_price_impact",
             "description": (
-                "Phân tích mức ảnh hưởng của kích thước và cấu trúc nhà (Area, Floors, Bedrooms, "
-                "Bathrooms, Frontage) lên giá bán. Dùng cho intent: "
-                "'physical size and structure affect price'."
+                "Bundle analysis for how size and structure (Area, Floors, Bedrooms, Bathrooms, Frontage) "
+                "associate with sale price. Use for the 'physical structure vs price' analytical intent."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "price_column": {
                         "type": "string",
-                        "description": "Tên cột giá (mặc định: Price)",
+                        "description": "Price column name (default: Price)",
                         "default": "Price",
                     }
                 },
@@ -332,31 +329,31 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
-    # ── 11. Phân tích intent 2: nhà to hơn có luôn đắt hơn không ─────────────
+    # ── 11. Intent bundle: bigger home = higher price? ─────────────────────────
     {
         "type": "function",
         "function": {
             "name": "analyze_bigger_house_premium",
             "description": (
-                "Đánh giá giả định 'nhà lớn hơn luôn đắt hơn' bằng nhóm diện tích, "
-                "so sánh giá trung vị và đo tỷ lệ ngoại lệ."
+                "Test the 'larger homes are always more expensive' assumption using area quantile bins, "
+                "median price by bin, and simple exception rates."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "area_column": {
                         "type": "string",
-                        "description": "Tên cột diện tích (mặc định: Area)",
+                        "description": "Area column name (default: Area)",
                         "default": "Area",
                     },
                     "price_column": {
                         "type": "string",
-                        "description": "Tên cột giá (mặc định: Price)",
+                        "description": "Price column name (default: Price)",
                         "default": "Price",
                     },
                     "bins": {
                         "type": "integer",
-                        "description": "Số nhóm diện tích quantile (mặc định 5)",
+                        "description": "Number of area quantile bins (default 5)",
                         "default": 5,
                     },
                 },

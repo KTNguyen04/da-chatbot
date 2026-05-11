@@ -8,6 +8,7 @@ RAG tiêu chuẩn dùng ChromaDB + sentence-transformers.
 """
 
 import os
+import time
 import hashlib
 import chromadb
 from chromadb.config import Settings
@@ -27,6 +28,32 @@ TOP_K = 3  # Số file trả về tối đa
 _embedder: Optional[SentenceTransformer] = None
 _chroma_client: Optional[chromadb.PersistentClient] = None
 _collection = None
+_last_rag_docs_fingerprint: Optional[str] = None
+# Skip sync_index() body (filesystem scan + Chroma checks) between queries when index is warm.
+_rag_sync_skip_until: float = 0.0
+_RAG_SYNC_COOLDOWN_SEC = 60.0
+
+
+def _rag_docs_fingerprint() -> str:
+    """Stable signature of supported files under rag_docs/ (name + mtime) for sync skipping."""
+    if not os.path.isdir(RAG_DOCS_DIR):
+        return ""
+    parts: list[str] = []
+    try:
+        names = sorted(os.listdir(RAG_DOCS_DIR))
+    except OSError:
+        return ""
+    for name in names:
+        fp = os.path.join(RAG_DOCS_DIR, name)
+        if not os.path.isfile(fp):
+            continue
+        if os.path.splitext(name)[1] not in SUPPORTED_EXTENSIONS:
+            continue
+        try:
+            parts.append(f"{name}:{os.path.getmtime(fp):.6f}")
+        except OSError:
+            parts.append(name)
+    return "|".join(parts)
 
 
 def _get_embedder() -> SentenceTransformer:
@@ -35,6 +62,15 @@ def _get_embedder() -> SentenceTransformer:
         print("[RAGDocs] Loading embedding model...")
         _embedder = SentenceTransformer(EMBEDDING_MODEL)
     return _embedder
+
+
+def warmup_rag_embedder() -> None:
+    """
+    Load SentenceTransformer + Chroma client once at app startup so the first
+    RAG query does not pay the full model cold-start cost.
+    """
+    _get_embedder()
+    _get_collection()
 
 
 def _get_collection():
@@ -75,7 +111,17 @@ def _read_file(filepath: str) -> Optional[str]:
 # ── Core API ──────────────────────────────────────────────────────────────────
 def sync_index():
     """Duyệt thư mục rag_docs/ và cập nhật database với logic CHUNKING."""
+    global _last_rag_docs_fingerprint, _rag_sync_skip_until
+    fp_now = _rag_docs_fingerprint()
     collection = _get_collection()
+    # Avoid re-scanning every file + Chroma lookups on each user query when nothing changed.
+    if (
+        _last_rag_docs_fingerprint == fp_now
+        and fp_now != ""
+        and collection.count() > 0
+    ):
+        _rag_sync_skip_until = time.monotonic() + _RAG_SYNC_COOLDOWN_SEC
+        return
     embedder = _get_embedder()
 
     # Lấy danh sách file hiện có
@@ -125,6 +171,9 @@ def sync_index():
         )
         print(f"[RAGDocs] Indexed {filename} split into {len(chunks)} chunks.")
 
+    _last_rag_docs_fingerprint = fp_now
+    _rag_sync_skip_until = time.monotonic() + _RAG_SYNC_COOLDOWN_SEC
+
 
 def query_docs(question: str, top_k: int = TOP_K) -> list[dict]:
     """
@@ -132,10 +181,14 @@ def query_docs(question: str, top_k: int = TOP_K) -> list[dict]:
     Trả về list[dict] với keys: file_id, filename, content, score.
     Mỗi phần tử = 1 file nguyên vẹn (không chunk).
     """
-    # Auto-sync để tránh trường hợp query khi chưa index.
-    sync_index()
-
+    global _rag_sync_skip_until
     collection = _get_collection()
+    now = time.monotonic()
+    # Hot path: avoid sync_index (listdir + per-file Chroma checks) on every chat turn.
+    if not (collection.count() > 0 and now < _rag_sync_skip_until):
+        sync_index()
+        collection = _get_collection()
+
     if collection.count() == 0:
         return []
 

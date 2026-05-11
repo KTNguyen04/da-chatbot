@@ -1,15 +1,15 @@
 # tools/__init__.py
 """
-Tool Registry – tự động load tất cả module trong thư mục tools/.
+Tool registry: auto-load every module under tools/.
 
-Mỗi module phải export:
-  TOOL_DEFINITIONS : list[dict]   – mô tả tool theo chuẩn Ollama/OpenAI function-calling
-  TOOL_FUNCTIONS   : dict[str, callable]  – ánh xạ tên tool → hàm thực thi
+Each module should export:
+  TOOL_DEFINITIONS : list[dict]   — Ollama/OpenAI function-calling schemas (English descriptions recommended)
+  TOOL_FUNCTIONS   : dict[str, callable]  — tool name → Python implementation
 
-Để thêm tool mới:
-  1. Tạo file tools/my_new_tools.py
-  2. Định nghĩa TOOL_DEFINITIONS + TOOL_FUNCTIONS
-  3. Không cần sửa bất kỳ file nào khác – registry tự nhận.
+To add tools:
+  1. Create tools/my_new_tools.py
+  2. Define TOOL_DEFINITIONS + TOOL_FUNCTIONS
+  3. No other edits required — this registry picks them up on import.
 """
 
 import importlib
@@ -18,13 +18,13 @@ from pathlib import Path
 from typing import Optional, Callable
 from colorama import Fore
 
-# ── Registry toàn cục ─────────────────────────────────────────────────────────
-ALL_TOOL_DEFINITIONS: list[dict] = []   # tập hợp tất cả schema mô tả tool
-ALL_TOOL_FUNCTIONS: dict[str, callable] = {}  # tên tool → hàm Python
+# ── Global registry ───────────────────────────────────────────────────────────
+ALL_TOOL_DEFINITIONS: list[dict] = []
+ALL_TOOL_FUNCTIONS: dict[str, callable] = {}
 
 
 def _load_all_tools() -> None:
-    """Duyệt qua tất cả module trong tools/ và đăng ký tool."""
+    """Import each tools.* module and register exported definitions."""
     package_dir = Path(__file__).parent
     package_name = __name__  # "tools"
 
@@ -42,7 +42,7 @@ def _load_all_tools() -> None:
             if not defs or not funcs:
                 print(
                     f"{Fore.LIGHTYELLOW_EX}[ToolRegistry] {module_name}: "
-                    f"thiếu TOOL_DEFINITIONS hoặc TOOL_FUNCTIONS, bỏ qua.{Fore.RESET}"
+                    f"missing TOOL_DEFINITIONS or TOOL_FUNCTIONS, skipping.{Fore.RESET}"
                 )
                 continue
 
@@ -56,7 +56,7 @@ def _load_all_tools() -> None:
 
         except Exception as e:
             print(
-                f"{Fore.LIGHTRED_EX}[ToolRegistry] Lỗi load '{full_module}': {e}{Fore.RESET}"
+                f"{Fore.LIGHTRED_EX}[ToolRegistry] Failed to load '{full_module}': {e}{Fore.RESET}"
             )
 
 
@@ -65,10 +65,10 @@ _load_all_tools()
 
 
 def get_tool_definitions() -> list[dict]:
-    """Trả về danh sách schema tất cả tool đã đăng ký."""
+    """Return all registered tool schemas."""
     return ALL_TOOL_DEFINITIONS
 
 
 def get_tool_function(name: str) -> Optional[Callable]:
-    """Trả về hàm thực thi của tool theo tên, hoặc None nếu không tìm thấy."""
+    """Return the implementation for a tool name, or None if unknown."""
     return ALL_TOOL_FUNCTIONS.get(name)

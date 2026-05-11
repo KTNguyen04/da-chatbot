@@ -28,7 +28,7 @@ from tools import get_tool_definitions, get_tool_function
 # Import hàm inject df vào từng module tool
 import tools.housing_tools as _housing_tools
 
-TOOL_TIMEOUT = 90   # giây chờ LLM phản hồi
+TOOL_TIMEOUT = 30  # giây chờ LLM phản hồi (fail fast; tăng nếu model chậm)
 MAX_TOOL_ROUNDS = 3  # số vòng tool-calling tối đa (tránh vòng lặp vô hạn)
 
 
@@ -45,13 +45,14 @@ def _inject_dataframe(df: pd.DataFrame) -> None:
 
 # ── Build system prompt ────────────────────────────────────────────────────────
 def _build_system_prompt(user_question: str = "") -> str:
+    """English system instructions; model must still answer end users in Vietnamese."""
     tool_names = [
         t["function"]["name"]
         for t in get_tool_definitions()
         if "function" in t
     ]
 
-    # Hint cụ thể cho câu hỏi về tỉnh/thành
+    # Keyword hints (user questions are Vietnamese)
     province_keywords = [
         "tỉnh nào", "thành phố nào", "province", "xuất hiện nhiều nhất",
         "phân bổ theo tỉnh", "bao nhiêu bất động sản ở mỗi tỉnh",
@@ -60,8 +61,7 @@ def _build_system_prompt(user_question: str = "") -> str:
     province_note = ""
     if any(kw in user_question.lower() for kw in province_keywords):
         province_note = (
-            "\n⚡ Câu hỏi này hỏi về tỉnh/thành phố → "
-            "Hãy gọi tool `get_province_ranking` để lấy số liệu chính xác.\n"
+            "\n⚡ Province/city frequency question → call `get_province_ranking` for exact counts.\n"
         )
 
     price_driver_keywords = [
@@ -72,26 +72,25 @@ def _build_system_prompt(user_question: str = "") -> str:
     q = user_question.lower()
     if any(kw in q for kw in price_driver_keywords) and ("giá" in q or "price" in q):
         price_driver_note = (
-            "\n⚡ Câu hỏi này thuộc nhóm price drivers → "
-            "Ưu tiên gọi `analyze_property_structure_price_impact` cho intent "
-            "'Physical Structure vs. Price' và `analyze_bigger_house_premium` cho intent "
-            "'Bigger = More Expensive?'. Có thể bổ sung `analyze_price_drivers`, "
-            "`price_vs_size_summary`, `structure_group_price_compare` để đối chiếu.\n"
+            "\n⚡ Price-driver style question → prefer `analyze_property_structure_price_impact` "
+            "for 'Physical Structure vs. Price' and `analyze_bigger_house_premium` for "
+            "'Bigger = More Expensive?'. You may add `analyze_price_drivers`, "
+            "`price_vs_size_summary`, `structure_group_price_compare` for cross-checks.\n"
         )
 
     return (
-        "Bạn là chuyên gia phân tích dữ liệu bất động sản Việt Nam. "
-        "Bạn có quyền gọi các tool sau để lấy số liệu chính xác từ dataset trước khi trả lời:\n"
+        "You are a senior data analyst for a Vietnam housing dataset. "
+        "You may call the following tools to obtain exact numbers from the dataframe before answering:\n"
         f"{', '.join(tool_names)}\n\n"
         f"{province_note}{price_driver_note}"
-        "Quy tắc:\n"
-        "- Luôn gọi tool khi cần số liệu cụ thể thay vì ước đoán.\n"
-        "- Với câu hỏi về tỉnh/thành phố xuất hiện nhiều/ít nhất → gọi `get_province_ranking`.\n"
-        "- Với câu hỏi so sánh giá/diện tích theo tỉnh → gọi `compare_mean_by_group`.\n"
-        "- Có thể gọi nhiều tool liên tiếp nếu cần.\n"
-        "- Sau khi có kết quả tool, tổng hợp insight ngắn gọn bằng tiếng Việt (tối đa 200 từ).\n"
-        "- Tập trung vào câu hỏi của người dùng, không lan man.\n"
-        "- Trình bày số liệu rõ ràng: in đậm giá trị quan trọng.\n"
+        "Rules:\n"
+        "- Always call tools when specific figures are needed; do not guess.\n"
+        "- For which province/city appears most/least often → call `get_province_ranking`.\n"
+        "- For comparing mean price or area by province → call `compare_mean_by_group`.\n"
+        "- You may chain multiple tool calls when useful.\n"
+        "- After tool results, write a concise insight in Vietnamese for the end user (max ~200 words).\n"
+        "- Stay focused on the user's question.\n"
+        "- Present numbers clearly; emphasize key values (e.g. markdown bold).\n"
     )
 
 
@@ -184,22 +183,13 @@ def run_tool_insight(
     df: pd.DataFrame,
     ollama_base_url: str = "http://localhost:11434",
     model: str = "qwen2.5:7b",
-    lang: str = "vi",
     verbose: bool = False,
 ) -> str:
     """
-    Chạy vòng tool-calling để sinh insight từ câu hỏi người dùng.
+    Run tool-calling rounds and return a natural-language insight for the user.
 
-    Args:
-        user_question:   Câu hỏi gốc của người dùng.
-        df:              DataFrame chính để phân tích.
-        ollama_base_url: URL Ollama server.
-        model:           Model text LLM (phải hỗ trợ function-calling).
-        lang:            Ngôn ngữ ('vi' hoặc 'en').
-        verbose:         In log debug.
-
-    Returns:
-        Chuỗi insight tiếng Việt từ LLM sau khi gọi tool(s).
+    The UI is Vietnamese-only: the returned text must be Vietnamese even though
+    prompts to the model are written in English.
     """
     # ── Inject df vào tất cả tool modules ────────────────────────────────────
     _inject_dataframe(df)
@@ -208,16 +198,14 @@ def run_tool_insight(
     if not tool_defs:
         return "⚠️ Không có tool nào được đăng ký."
 
-    # ── Xây dựng conversation ban đầu ────────────────────────────────────────
-    lang_note = "Trả lời bằng tiếng Việt." if lang == "vi" else "Answer in English."
     messages: list[dict] = [
         {"role": "system", "content": _build_system_prompt(user_question)},
         {
             "role": "user",
             "content": (
-                f"Câu hỏi: {user_question}\n\n"
-                f"Hãy gọi tool phù hợp để lấy số liệu, "
-                f"sau đó trả lời insight ngắn gọn. {lang_note}"
+                f"User question (Vietnamese): {user_question}\n\n"
+                "Call the appropriate tool(s) to fetch exact figures from the dataset, "
+                "then reply with a short insight. Respond in Vietnamese only."
             ),
         },
     ]
