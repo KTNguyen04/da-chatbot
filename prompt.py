@@ -37,9 +37,12 @@ def _matplotlib_graph_hints() -> str:
     """Task-agnostic plotting hints; model chooses chart type from question + dtypes."""
     return """
 <code_ref>
-- `fig, ax = plt.subplots(...)`; `fig.tight_layout()` before `result`. Choose sns/plt by task
-  (bar/hist-scatter/box-violin/pie+Khác/line/heatmap as fits data). Exotic requests → closest
-  supported plot + note limit in `analysis`. Crowded labels ~45°; titles/axes in Vietnamese.
+- `fig, ax = plt.subplots(...)`; `fig.tight_layout()` before `result`.
+- Choose sns/plt by task.
+- PRE-IMPORTED: `import pandas as pd`, `import numpy as np`, `import matplotlib.pyplot as plt`, `import seaborn as sns`, `from matplotlib.figure import Figure`.
+- DATA: `df` and `DF_1` refer to the main dataframe.
+- TITLES/AXES: Vietnamese.
+- RESULTS: `result = {"figure": fig, "analysis": "..."}` or `result = df`.
 </code_ref>
 """
 
@@ -97,7 +100,7 @@ def define_graph_type(llm: object, question_user: str, hist_questions: str) -> s
 
 
 def process_prompt(
-    session_msgs: list[dict], user_question: str, data: dict, llm: object
+    session_msgs: list[dict], user_question: str, data: dict, llm: object, intent: str = None, graph_type: str = "none"
 ) -> str:
     """
     Build metadata, RAG routing, semantic RAG from rag_docs/, and the final code-generation prompt.
@@ -144,7 +147,7 @@ def process_prompt(
     user_questions = [item for item in session_msgs if item["role"] == "user"]
     questions_text = "\n".join([item["question"] for item in user_questions])
 
-    graph_type = define_graph_type(llm, user_question, questions_text)
+    # intent and graph_type are now passed from app.py to avoid redundant LLM calls
     params_plot = _matplotlib_graph_hints()
 
     try:
@@ -218,13 +221,8 @@ def process_prompt(
 
 Use DF_* from <metadata>; default primary = DF_1 unless question says otherwise.
 
-```python
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-# ...
-df = ...  # DF_*
-# ...
+# df = DF_1 (already available)
+# No need to import pandas, matplotlib, seaborn, or numpy. They are already in the environment.
 {result_instruction}
 result = None
 ```

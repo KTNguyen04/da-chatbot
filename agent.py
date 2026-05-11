@@ -2,8 +2,10 @@
 import re
 import builtins
 import traceback
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from matplotlib.figure import Figure
 from time import sleep
@@ -185,8 +187,9 @@ class AgentAI:
                         return error_message
 
                 prompt_ = prompt + tag_last_code + tag_error
+                # No actual sleep here to avoid latency, but we could add a tiny one if needed.
                 print(
-                    f"{Fore.YELLOW}[AGENT] Đính kèm error vào prompt — thử lại sau 3s...{Fore.RESET}"
+                    f"{Fore.YELLOW}[AGENT] Đính kèm error vào prompt — thử lại ngay...{Fore.RESET}"
                 )
 
                 if attempts_var == self.max_attempts:
@@ -195,7 +198,7 @@ class AgentAI:
                         f"{Fore.LIGHTRED_EX}[AGENT] Đã hết số lần thử ({self.max_attempts}) — trả về lỗi{Fore.RESET}"
                     )
                     return f"EXCEPTION ERROR: {error_message}"
-                sleep(3)
+
 
     def chat_stop(self):
         """
@@ -338,10 +341,19 @@ class AgentAI:
         }
 
         # Global environment
-        global_env = {"__builtins__": allowed_builtins}
+        global_env = {
+            "__builtins__": allowed_builtins,
+            "pd": pd,
+            "np": np,
+            "plt": plt,
+            "sns": sns,
+            "Figure": Figure,
+        }
 
         for i, var in enumerate(self.data):
             global_env[f"DF_{i+1}"] = var
+            if i == 0:
+                global_env["df"] = var  # Alias for DF_1
 
         return global_env
 
