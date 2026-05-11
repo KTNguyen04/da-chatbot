@@ -21,7 +21,7 @@ build/
 
 # === Data & Large Files ===
 # Common patterns for local data you don't want to track
-*.csv
+
 *.json
 *.xlsx
 *.parquet
