@@ -4,10 +4,28 @@ import os
 from datetime import datetime
 import re
 
+import numpy as np
 import plotly.graph_objs as go
 import plotly.io as pio
 
 LOG_DIR = "./conversation_logs"
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy scalars, arrays, and NaN/Inf values."""
+
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
 
 
 def _ensure_log_dir() -> None:
@@ -42,6 +60,16 @@ def _figure_to_b64_png(figure: go.Figure) -> str | None:
     return base64.b64encode(png_bytes).decode("utf-8")
 
 
+def _figure_to_json_safe(figure: go.Figure) -> object:
+    """Convert a Plotly figure to a JSON-serializable dict, stripping numpy types."""
+    try:
+        raw = figure.to_plotly_json()
+        # Round-trip through _NumpyEncoder to sanitize all numpy values.
+        return json.loads(json.dumps(raw, cls=_NumpyEncoder))
+    except Exception:
+        return None
+
+
 def _extract_figure(payload: object) -> go.Figure | None:
     if isinstance(payload, go.Figure):
         return payload
@@ -68,7 +96,7 @@ def _serialize_message(message: dict) -> dict:
     if role == "assistant" and figure is not None:
         serialized["type"] = "chart_image"
         serialized["chart_image_b64"] = _figure_to_b64_png(figure)
-        serialized["chart_figure_json"] = figure.to_plotly_json()
+        serialized["chart_figure_json"] = _figure_to_json_safe(figure)  # ← fixed
         analysis = ""
         if isinstance(payload, dict):
             analysis = str(payload.get("analysis", "")).strip()
@@ -114,7 +142,7 @@ def save_conversation(messages: list[dict], latest_code: str | None = None) -> s
         "messages": [_serialize_message(message) for message in prepared_messages],
     }
     with open(filepath, "w", encoding="utf-8") as file_obj:
-        json.dump(payload, file_obj, ensure_ascii=False, indent=2)
+        json.dump(payload, file_obj, ensure_ascii=False, indent=2, cls=_NumpyEncoder)  # ← fixed
     return filepath
 
 
