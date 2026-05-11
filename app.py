@@ -9,11 +9,13 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objs as go
 import plotly.express as px
+import base64
 
 from colorama import Fore
 from agent import AgentAI
 from prompt import process_prompt
 from styles import process_styles
+import conversation_logger
 
 from langchain_groq import ChatGroq
 from langchain_cohere import ChatCohere
@@ -434,12 +436,17 @@ if "agent_var" not in st.session_state:
     st.session_state["agent_var"] = None
 if "geojson_var" not in st.session_state:
     st.session_state["geojson_var"] = None
+if "viewing_log" not in st.session_state:
+    st.session_state["viewing_log"] = None
 
 
 def clear_chat_history() -> None:
     """
     Clear chat history | reset session variables | stop runtime agent.
     """
+
+    # Save current chat before clearing.
+    conversation_logger.save_conversation(st.session_state.get("messages", []))
 
     # Reset session_state vars
     st.session_state["last_code"] = ""
@@ -464,12 +471,38 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
         data: dictionary of dataframes
     """
 
-    with st.chat_message("assistant"):
-        st.write("Chào bạn! Mình sẵn sàng giúp bạn khám phá dữ liệu. Bắt đầu thôi?")
-
     # Initialize chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
+
+    if st.session_state.get("viewing_log"):
+        viewing_path = st.session_state["viewing_log"]
+        log_name = os.path.basename(viewing_path)
+        st.info(
+            f"📂 Viewing archived conversation — {log_name}. Chat is disabled."
+        )
+        try:
+            archived_payload = conversation_logger.load_conversation(viewing_path)
+            for message in archived_payload.get("messages", []):
+                with st.chat_message(message.get("role", "assistant")):
+                    msg_type = message.get("type", "text")
+                    msg_content = message.get("content", "")
+                    if msg_type == "code":
+                        st.code(msg_content, language="python")
+                    elif msg_type == "chart_image":
+                        chart_b64 = message.get("chart_image_b64")
+                        if chart_b64:
+                            st.image(base64.b64decode(chart_b64))
+                        if msg_content:
+                            st.markdown(msg_content)
+                    else:
+                        st.markdown(msg_content)
+        except Exception as exc:
+            st.error(f"Không thể mở hội thoại đã lưu: {exc}")
+        return
+
+    with st.chat_message("assistant"):
+        st.write("Chào bạn! Mình sẵn sàng giúp bạn khám phá dữ liệu. Bắt đầu thôi?")
 
     # Show messages from chat history
     for message in st.session_state.messages:
@@ -946,6 +979,37 @@ def main() -> None:
         # Force Vietnamese for user prompts and chatbot output.
         st.session_state["lang_var"] = "vi"
         st.session_state["sample_var"] = N_SAMPLES
+
+        side_container_1 = st.sidebar.container(border=True)
+        side_container_1.markdown("##### Saved Conversations")
+        log_paths = conversation_logger.list_conversations()
+        selector_options = ["Current Chat", *log_paths]
+
+        current_viewing = st.session_state.get("viewing_log")
+        default_index = 0
+        if current_viewing in log_paths:
+            default_index = selector_options.index(current_viewing)
+
+        with side_container_1.expander("Open conversation", expanded=False):
+            selected_conversation = st.selectbox(
+                "Conversation",
+                options=selector_options,
+                index=default_index,
+                format_func=lambda item: (
+                    "Current Chat"
+                    if item == "Current Chat"
+                    else os.path.basename(str(item))
+                ),
+                key="conversation_selector",
+                label_visibility="collapsed",
+            )
+
+        selected_log_path = (
+            None if selected_conversation == "Current Chat" else selected_conversation
+        )
+        if selected_log_path != st.session_state.get("viewing_log"):
+            st.session_state["viewing_log"] = selected_log_path
+            st.rerun()
 
         # Button to delete chat history
         side_container_2 = st.sidebar.container(border=True)
