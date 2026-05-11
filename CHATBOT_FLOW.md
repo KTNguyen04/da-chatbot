@@ -24,7 +24,7 @@ flowchart TD
   P0 -->|Price-driver (optional)| TI0[Tool Insight precompute<br/>run_tool_insight()]
   P0 --> P1[prompt.py: process_prompt()<br/>metadata + graph routing + RAG inject + code instructions]
   P1 --> AG[agent.py: AgentAI.chat()<br/>LLM sinh Python code]
-  AG --> EX[Sandbox exec_code()<br/>restricted imports + DF_1.. + GEOJSON]
+  AG --> EX[Sandbox exec_code()<br/>restricted imports + DF_1..]
   EX --> R[result = text OR df OR figure OR {figure,analysis}]
 
   R --> TI1[STEP 5: Tool Insight (optional)<br/>run_tool_insight()]
@@ -231,7 +231,6 @@ thì app chạy **tool-calling insight** trước khi gọi code-agent:
 `exec_code(code)`:
 - Tạo env qua `create_isolated_env()`:
   - inject `DF_1`, `DF_2`, ... (từ list dataframes)
-  - inject `GEOJSON`
   - override `__import__` bằng `restricted_import` (chặn import ngoài whitelist)
 - `exec(code, env, context)` và lấy `context["result"]`
 - chặn `plotly.Figure.show()` (bắt buộc trả fig object thay vì show)

@@ -23,28 +23,99 @@ from colorama import Fore
 from typing import Any, Optional, List
 
 import tools  # auto-load tất cả tool modules qua registry
-from tools import get_tool_definitions, get_tool_function
-
-# Import hàm inject df vào từng module tool
-import tools.housing_tools as _housing_tools
+from tools import get_tool_definitions, get_tool_function, inject_dataframe_into_all_tool_modules
 
 TOOL_TIMEOUT = 30  # giây chờ LLM phản hồi (fail fast; tăng nếu model chậm)
-MAX_TOOL_ROUNDS = 3  # số vòng tool-calling tối đa (tránh vòng lặp vô hạn)
+MAX_TOOL_ROUNDS = 5  # số vòng tool-calling tối đa (EDA thường cần nhiều bước)
+
+MAX_TOOL_MESSAGE_JSON_CHARS = 22_000
+MAX_TOOL_LIST_ITEMS = 40
+MAX_TOOL_STRING_CHARS = 4_000
 
 
 # ── Inject DataFrame vào tất cả tool modules ──────────────────────────────────
 def _inject_dataframe(df: pd.DataFrame) -> None:
     """
-    Set DataFrame cho tất cả tool module đã đăng ký.
-    Gọi trước mỗi lần thực thi để đảm bảo tool dùng data mới nhất.
+    Set DataFrame cho mọi module tools đã đăng ký hàm set_dataframe (registry).
     """
-    _housing_tools.set_dataframe(df)
-    # Khi thêm module mới: import và set_dataframe tương tự ở đây
-    # Ví dụ: import tools.stock_tools as _stock_tools; _stock_tools.set_dataframe(df)
+    inject_dataframe_into_all_tool_modules(df)
+
+
+def _dataset_brief(df: pd.DataFrame) -> str:
+    lines = [
+        f"Shape: {len(df):,} rows × {len(df.columns)} columns.",
+        "Columns (name: dtype):",
+    ]
+    dtype_map = df.dtypes.astype(str).to_dict()
+    for i, col in enumerate(df.columns):
+        if i >= 48:
+            lines.append(f"  … +{len(df.columns) - 48} more")
+            break
+        lines.append(f"  - {col}: {dtype_map[col]}")
+    low = {str(c).lower() for c in df.columns}
+    hints: list[str] = []
+    if "province" in low:
+        hints.append("Province column → `get_province_ranking` / `compare_mean_by_group` when relevant.")
+    if "price" in low or "price_per_m2" in low:
+        hints.append("Price-like columns → domain tools `analyze_price_drivers`, `compare_mean_by_group`, etc.")
+    if hints:
+        lines.append("Dataset hints: " + " ".join(hints))
+    return "\n".join(lines)
+
+
+def _truncate_tool_payload(obj: Any, depth: int = 0) -> Any:
+    """Shrink tool JSON so LLM context stays bounded (drops tracebacks)."""
+    if depth > 12:
+        return "<truncated: max depth>"
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k == "traceback":
+                continue
+            out[k] = _truncate_tool_payload(v, depth + 1)
+        return out
+    if isinstance(obj, list):
+        if len(obj) > MAX_TOOL_LIST_ITEMS:
+            head = [_truncate_tool_payload(x, depth + 1) for x in obj[:MAX_TOOL_LIST_ITEMS]]
+            head.append({"_truncated_items": len(obj) - MAX_TOOL_LIST_ITEMS})
+            return head
+        return [_truncate_tool_payload(x, depth + 1) for x in obj]
+    if isinstance(obj, str):
+        if len(obj) > MAX_TOOL_STRING_CHARS:
+            return obj[: MAX_TOOL_STRING_CHARS - 3] + "..."
+        return obj
+    if isinstance(obj, (int, float, bool)) or obj is None:
+        return obj
+    try:
+        if hasattr(obj, "item"):
+            return obj.item()
+    except Exception:
+        pass
+    s = str(obj)
+    if len(s) > MAX_TOOL_STRING_CHARS:
+        return s[: MAX_TOOL_STRING_CHARS - 3] + "..."
+    return s
+
+
+def _tool_result_to_llm_json(tool_result: Any) -> str:
+    payload = _truncate_tool_payload(tool_result)
+    text = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(text) <= MAX_TOOL_MESSAGE_JSON_CHARS:
+        return text
+    insight = ""
+    if isinstance(tool_result, dict):
+        insight = str(tool_result.get("insight", ""))
+    shrink = {
+        "truncated": True,
+        "original_json_chars": len(text),
+        "preview": text[: MAX_TOOL_MESSAGE_JSON_CHARS - 800],
+        "insight_preserved": insight[:2000],
+    }
+    return json.dumps(shrink, ensure_ascii=False, default=str)
 
 
 # ── Build system prompt ────────────────────────────────────────────────────────
-def _build_system_prompt(user_question: str = "") -> str:
+def _build_system_prompt(user_question: str = "", df: Optional[pd.DataFrame] = None) -> str:
     """English system instructions; model must still answer end users in Vietnamese."""
     tool_names = [
         t["function"]["name"]
@@ -52,41 +123,56 @@ def _build_system_prompt(user_question: str = "") -> str:
         if "function" in t
     ]
 
-    # Keyword hints (user questions are Vietnamese)
+    brief = ""
+    if df is not None and len(df.columns):
+        brief = f"<dataset>\n{_dataset_brief(df)}\n</dataset>\n\n"
+
+    cols_lower = set()
+    if df is not None:
+        cols_lower = {str(c).lower() for c in df.columns}
+
+    # Keyword hints (user questions are often Vietnamese)
     province_keywords = [
         "tỉnh nào", "thành phố nào", "province", "xuất hiện nhiều nhất",
         "phân bổ theo tỉnh", "bao nhiêu bất động sản ở mỗi tỉnh",
-        "top tỉnh", "xếp hạng tỉnh", "tỉnh nào nhiều nhất", "tỉnh nào ít nhất"
+        "top tỉnh", "xếp hạng tỉnh", "tỉnh nào nhiều nhất", "tỉnh nào ít nhất",
     ]
     province_note = ""
-    if any(kw in user_question.lower() for kw in province_keywords):
+    qlow = user_question.lower()
+    if "province" in cols_lower and any(kw in qlow for kw in province_keywords):
         province_note = (
-            "\n⚡ Province/city frequency question → call `get_province_ranking` for exact counts.\n"
+            "\n⚡ Province/city frequency → call `get_province_ranking` for exact counts.\n"
         )
 
     price_driver_keywords = [
         "ảnh hưởng", "tác động", "liệu", "có luôn", "nhà to hơn",
-        "diện tích", "phòng ngủ", "phòng tắm", "số tầng", "mặt tiền", "cấu trúc"
+        "diện tích", "phòng ngủ", "phòng tắm", "số tầng", "mặt tiền", "cấu trúc",
     ]
     price_driver_note = ""
-    q = user_question.lower()
-    if any(kw in q for kw in price_driver_keywords) and ("giá" in q or "price" in q):
+    if (
+        ("price" in cols_lower or "price_per_m2" in cols_lower)
+        and any(kw in qlow for kw in price_driver_keywords)
+        and ("giá" in qlow or "price" in qlow)
+    ):
         price_driver_note = (
             "\n⚡ Price-driver style question → prefer `analyze_property_structure_price_impact` "
-            "for 'Physical Structure vs. Price' and `analyze_bigger_house_premium` for "
-            "'Bigger = More Expensive?'. You may add `analyze_price_drivers`, "
-            "`price_vs_size_summary`, `structure_group_price_compare` for cross-checks.\n"
+            "and `analyze_bigger_house_premium`; cross-check with `analyze_price_drivers`, "
+            "`price_vs_size_summary`, `structure_group_price_compare` when useful.\n"
         )
 
     return (
-        "You are a senior data analyst for a Vietnam housing dataset. "
+        "You are a senior data analyst working on the user's currently loaded tabular dataset.\n"
+        f"{brief}"
         "You may call the following tools to obtain exact numbers from the dataframe before answering:\n"
         f"{', '.join(tool_names)}\n\n"
         f"{province_note}{price_driver_note}"
         "Rules:\n"
+        "- When column names, dtypes, or shape are uncertain, call `get_data_profile` first.\n"
         "- Always call tools when specific figures are needed; do not guess.\n"
-        "- For which province/city appears most/least often → call `get_province_ranking`.\n"
-        "- For comparing mean price or area by province → call `compare_mean_by_group`.\n"
+        "- For generic exploration use `profile_column`, `filter_rows`, `pivot_summary`, "
+        "`numeric_correlation_pairs`, `compare_two_groups_stat_test`, `chi_square_categorical_association`.\n"
+        "- If a Province column exists and the user asks ranking by province → `get_province_ranking`.\n"
+        "- For comparing a numeric metric across one categorical dimension → `compare_mean_by_group`.\n"
         "- You may chain multiple tool calls when useful.\n"
         "- After tool results, write a concise insight in Vietnamese for the end user (max ~200 words).\n"
         "- Stay focused on the user's question.\n"
@@ -159,16 +245,18 @@ def _execute_tool_calls(tool_calls: list[dict], verbose: bool = False) -> list[d
                     insight = tool_result.get("insight", "")
                     print(f"{Fore.LIGHTGREEN_EX}[ToolExecutor] Kết quả: {insight}{Fore.RESET}")
             except Exception as e:
+                tb = traceback.format_exc()
+                if verbose:
+                    print(f"{Fore.LIGHTRED_EX}[ToolExecutor] Traceback:\n{tb}{Fore.RESET}")
                 tool_result = {
                     "error": f"Lỗi khi thực thi tool '{tool_name}': {str(e)}",
-                    "traceback": traceback.format_exc(),
                 }
                 print(f"{Fore.LIGHTRED_EX}[ToolExecutor] Lỗi tool: {e}{Fore.RESET}")
 
         # Chuẩn format Ollama tool result message
         results.append({
             "role": "tool",
-            "content": json.dumps(tool_result, ensure_ascii=False, default=str),
+            "content": _tool_result_to_llm_json(tool_result),
         })
 
     return results
@@ -199,7 +287,7 @@ def run_tool_insight(
         return "⚠️ Không có tool nào được đăng ký."
 
     messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt(user_question)},
+        {"role": "system", "content": _build_system_prompt(user_question, df)},
         {
             "role": "user",
             "content": (

@@ -1,19 +1,25 @@
 # AgentAI
 import re
-import json
 import builtins
 import traceback
-import streamlit as st
 import pandas as pd
-import plotly.graph_objs as go
+import matplotlib.pyplot as plt
 
+from matplotlib.figure import Figure
 from time import sleep
 from typing import Union
 from colorama import Fore
 from abc import abstractmethod
 
 
-WHITELIST_DEFAULT = ["plotly", "numpy", "pandas", "sklearn"]
+WHITELIST_DEFAULT = [
+    "matplotlib",
+    "mpl_toolkits",
+    "seaborn",
+    "numpy",
+    "pandas",
+    "sklearn",
+]
 
 
 class AgentAI:
@@ -69,7 +75,7 @@ class AgentAI:
     def __del__(self):
         pass
 
-    def chat(self, prompt: str) -> Union[list, str, pd.DataFrame, go.Figure]:
+    def chat(self, prompt: str) -> Union[list, str, pd.DataFrame, Figure, dict]:
         """
         Invoke the chat language model with the provided prompt.
         Execute the returned code from the chat model.
@@ -79,8 +85,9 @@ class AgentAI:
             prompt (str): the name of the module to import.
 
         Returns:
-            Union[list, str, pd.DataFrame, go.Figure]: The output of the chat execution,
-                which could be a list, a string, a Pandas DataFrame or a Plotly figure.
+            Union[list, str, pd.DataFrame, Figure, dict]: The output of the chat execution,
+                which could be a list, a string, a DataFrame, a matplotlib Figure, or
+                a dict like {"figure": Figure, "analysis": str}.
         """
 
         attempts_var = 0
@@ -336,12 +343,6 @@ class AgentAI:
         for i, var in enumerate(self.data):
             global_env[f"DF_{i+1}"] = var
 
-        if st.session_state["geojson_var"] is not None:
-            geojson = json.loads(st.session_state["geojson_var"])
-        else:
-            geojson = ""
-        global_env["GEOJSON"] = [geojson]
-
         return global_env
 
     @abstractmethod
@@ -360,29 +361,25 @@ class AgentAI:
             str: The result of the executed code.
         """
 
-        # Block plotly show() method
-        go.Figure.show = self._intercept_show
+        plt.clf()
+        plt.close("all")
+        _saved_show = plt.show
+        plt.show = self._intercept_plt_show
 
         # Instanciate safe env
         env = self.create_isolated_env()
         context = {}
-        exec(code, env, context)
+        try:
+            exec(code, env, context)
+        finally:
+            plt.show = _saved_show
+
         code_result = context["result"]
 
         return code_result
 
-    @abstractmethod
-    def _intercept_show(self):
-        """
-        Intercept and block Plotly's show() method.
-
-        This method is used to intercept and block the execution of the Plotly `show()` method.
-        If the `show()` method is called, it raises a RuntimeError indicating that the execution
-        of the method is not allowed and should be removed from the code.
-
-        Raises:
-            RuntimeError: Indicates that the execution of the plotly `show()` method is not allowed.
-        """
+    @staticmethod
+    def _intercept_plt_show(*_args, **_kwargs):
         raise RuntimeError(
-            "Execution of the plotly fig.show() method is not allowed, remove it."
+            "plt.show() is not allowed; assign the matplotlib Figure to result per the prompt."
         )

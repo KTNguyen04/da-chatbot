@@ -7,7 +7,7 @@ import traceback
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objs as go
+from matplotlib.figure import Figure
 
 from colorama import Fore
 from agent import AgentAI
@@ -527,8 +527,6 @@ if "sample_var" not in st.session_state:
     st.session_state["sample_var"] = N_SAMPLES
 if "agent_var" not in st.session_state:
     st.session_state["agent_var"] = None
-if "geojson_var" not in st.session_state:
-    st.session_state["geojson_var"] = None
 
 
 def clear_chat_history() -> None:
@@ -574,16 +572,16 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
             elif "response" in message:
                 if isinstance(message["response"], str):
                     st.write(message["response"])
-                elif isinstance(message["response"], go.Figure):
-                    config = {"displaylogo": False}
-                    st.plotly_chart(message["response"], config=config)
+                elif isinstance(message["response"], Figure):
+                    st.pyplot(message["response"])
                 elif (
                     isinstance(message["response"], dict)
                     and "figure" in message["response"]
                 ):
-                    # Dict từ plot agent: {"figure": go.Figure, "analysis": str}
-                    config = {"displaylogo": False}
-                    st.plotly_chart(message["response"]["figure"], config=config)
+                    # Dict từ plot agent: {"figure": Figure, "analysis": str}
+                    fig_obj = message["response"]["figure"]
+                    if isinstance(fig_obj, Figure):
+                        st.pyplot(fig_obj)
                     analysis_text = message["response"].get("analysis", "")
                     if analysis_text:
                         st.markdown(analysis_text)
@@ -591,16 +589,14 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
                     message["response"], tuple
                 ):
                     for i in range(len(message["response"])):
-                        if isinstance(message["response"][i], go.Figure):
-                            config = {"displaylogo": False}
-                            st.plotly_chart(message["response"][i], config=config)
+                        if isinstance(message["response"][i], Figure):
+                            st.pyplot(message["response"][i])
                         else:
                             st.write(message["response"][i])
                 elif isinstance(message["response"], dict):
                     for key_, value_ in message["response"].items():
-                        if isinstance(message["response"][key_], go.Figure):
-                            config = {"displaylogo": False}
-                            st.plotly_chart(message["response"][key_], config=config)
+                        if isinstance(message["response"][key_], Figure):
+                            st.pyplot(message["response"][key_])
                         else:
                             st.write(message["response"][key_])
                 else:
@@ -786,14 +782,16 @@ User message: {effective_user_question}
                 # ── Tool-Calling Insight ─────────────────────────────────────
                 # Sau khi có figure/response, gọi LLM với tool-calling để tính
                 # số liệu thực từ DataFrame rồi sinh insight câu hỏi người dùng.
-                fig_for_insight: go.Figure | None = None
+                fig_for_insight: Figure | None = None
                 agent_analysis: str | None = None
 
                 if ENABLE_TOOL_INSIGHT:
                     if isinstance(response, dict):
-                        fig_for_insight = response.get("figure")
+                        cand = response.get("figure")
+                        if isinstance(cand, Figure):
+                            fig_for_insight = cand
                         agent_analysis = response.get("analysis")
-                    elif isinstance(response, go.Figure):
+                    elif isinstance(response, Figure):
                         fig_for_insight = response
 
                 tool_insight_text: str | None = None
@@ -885,9 +883,9 @@ User message: {effective_user_question}
                             )
                         if combined_insight:
                             response["analysis"] = combined_insight
-                        # Display figure immediately, then stream analysis
-                        config = {"displaylogo": False}
-                        st.plotly_chart(response["figure"], config=config)
+                        fig_out = response["figure"]
+                        if isinstance(fig_out, Figure):
+                            st.pyplot(fig_out)
                         if combined_insight:
                             _stream_text(combined_insight)
                         print(
@@ -896,16 +894,14 @@ User message: {effective_user_question}
                         st.session_state.messages.append(
                             {"role": "assistant", "response": response}
                         )
-                    elif isinstance(response, go.Figure):
+                    elif isinstance(response, Figure):
                         payload = {"figure": response}
                         if tool_insight_text:
                             payload["analysis"] = (
                                 "**🔧 Phân tích từ Tool Insight:**\n\n"
                                 f"{tool_insight_text}"
                             )
-                        # Display figure immediately, then stream analysis
-                        config = {"displaylogo": False}
-                        st.plotly_chart(response, config=config)
+                        st.pyplot(response)
                         if tool_insight_text:
                             st.markdown("**🔧 Phân tích từ Tool Insight:**\n")
                             _stream_text(tool_insight_text)

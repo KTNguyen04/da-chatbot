@@ -8,9 +8,7 @@ Changes from the original baseline:
   3. define_graph_type() extended for province / ranking style questions.
 """
 
-import os
 import traceback
-import functools
 import streamlit as st
 
 from io import StringIO
@@ -20,41 +18,11 @@ from rag_docs_manager import build_rag_context
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-@functools.lru_cache(maxsize=48)
-def _load_ragdata_code_ref(graph_type: str) -> str:
-    """
-    Load ragdata/<graph_type>.txt or fall back to base_ref.txt.
-    Cached: same graph_type avoids repeated disk I/O on every Streamlit rerun.
-    """
-    dir_path = "ragdata"
-    try:
-        names = os.listdir(dir_path)
-    except OSError:
-        names = []
-    for file_ in names:
-        file_name, file_ext = os.path.splitext(file_)
-        if file_name == graph_type and file_ext == ".txt":
-            file_path = os.path.join(dir_path, file_)
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    return f"\n\n<code_ref>\n{f.read()}\n</code_ref>"
-            except OSError:
-                break
-    try:
-        with open(os.path.join(dir_path, "base_ref.txt"), "r", encoding="utf-8") as f:
-            return f"\n\n<code_ref>\n{f.read()}\n</code_ref>"
-    except OSError:
-        return ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
 # End-user outputs are Vietnamese; instructions are English for model clarity.
 VIETNAMESE_USER_FACING_OUTPUT = (
     "All natural-language output for the end user (variable `analysis`, string `result`, "
-    "chart titles, axis labels, legends, hover/tooltip text, and any dataframe presentation text) "
-    "MUST be written in Vietnamese. Configure Plotly so every user-visible string is Vietnamese."
+    "chart titles, axis labels, legend text, and any dataframe presentation text) "
+    "MUST be written in Vietnamese. Every user-visible chart string must be Vietnamese."
 )
 
 STRICT_PROMPT_RULES = """
@@ -63,10 +31,46 @@ STRICT_PROMPT_RULES = """
 - Do NOT call the network or read files outside the current context.
 - Do NOT use fake or illustrative numbers as if they were real query results.
 - If a required column is missing, set `result` to a Vietnamese string explaining the missing data.
-- Do NOT use `plt` / matplotlib. For charts, use Plotly only.
+- For charts use matplotlib and seaborn only. Do NOT use plotly, plotly express, or bokeh.
+- Do NOT call plt.show(). Build a matplotlib.figure.Figure and pass it in `result` as specified.
 - Prefer brief Vietnamese comments on important logic blocks in generated code.
 </strict_rules>
 """
+
+
+def _matplotlib_graph_hints(graph_type: str) -> str:
+    """
+    Inline matplotlib/seaborn patterns per routed graph type (replaces ragdata/*.txt).
+    """
+    common = """
+- Use fig, ax = plt.subplots(figsize=(10, 6)) unless a multi-panel layout needs otherwise; fig.tight_layout() before assigning `result`.
+- Rotate crowded category labels (~45°). Prefer sns.set_theme(style=\"whitegrid\") when it helps readability.
+"""
+    hints: dict[str, str] = {
+        "bar_plot": "sns.barplot(data=df, x=..., y=..., ax=ax) or grouped counts: s = df[col].value_counts(); s.plot(kind='bar', ax=ax). For rankings, sort values descending first.",
+        "scatter_2d_plot": "sns.scatterplot(data=df, x=..., y=..., ax=ax, alpha=0.3-0.6) for dense clouds; cite trend/outliers in analysis.",
+        "bubble_plot": "sns.scatterplot(..., size=..., sizes=(20, 400), ax=ax) or ax.scatter with s= array scaled from a third numeric column.",
+        "scatter_3d_plot": "from mpl_toolkits.mplot3d import Axes3D  # use fig.add_subplot(projection='3d') then ax.scatter3D(xs, ys, zs).",
+        "line_plot": "sns.lineplot(data=df, x=..., y=..., ax=ax) or df.sort_values(...).plot(x=..., y=..., ax=ax).",
+        "histogram_plot": "sns.histplot(data=df, x=..., ax=ax, kde=False) or df[col].plot.hist(ax=ax, bins=...).",
+        "pie_plot": "df[col].value_counts().plot.pie(ax=ax, autopct='%1.1f%%') or ax.pie(...); limit slices (e.g. top N + Other).",
+        "box_plot": "sns.boxplot(data=df, x=..., y=..., ax=ax) or sns.boxplot(x=group, y=value, data=df, ax=ax).",
+        "area_plot": "df.pivot_table(...).plot.area(ax=ax) or fill_between for stacked trends.",
+        "heatmap": "sns.heatmap(df[numeric_cols].corr(), annot=True, fmt='.2f', cmap='coolwarm', ax=ax, center=0).",
+        "violin_plot": "sns.violinplot(data=df, x=..., y=..., ax=ax).",
+        "density_contour_plot": "sns.kdeplot(data=df, x=..., y=..., fill=True, ax=ax) for 2D density.",
+        "polar_plot": "ax = fig.add_subplot(projection='polar'); ax.plot(theta, r).",
+        "surface_plot": "from mpl_toolkits.mplot3d import Axes3D; plot_surface on 3D axes for grid Z.",
+        "candle_plot": "matplotlib does not have native OHLC; use line plot of close or bar chart of range per period, and state limitation in analysis.",
+        "treemap_plot": "No native treemap; use horizontal bar of top categories by value, or stacked bar — note the mapping in analysis.",
+        "sunburst_plot": "No native sunburst; use nested bar or grouped bar for top two levels — note the mapping in analysis.",
+        "choroplethmap_plot": "Without geopandas, approximate with bar chart by Province/region column; mention simplification in analysis.",
+        "densitymap_plot": "Approximate with 2D kdeplot on lon/lat if columns exist; else bar by region.",
+        "scattermap_plot": "If lat/lon exist use scatterplot colored by metric; else bar by province.",
+        "base_ref": "Pick sns or ax API consistent with <main_question>; keep layout readable and titled in Vietnamese.",
+    }
+    body = hints.get(graph_type, hints["base_ref"])
+    return f"\n\n<code_ref>\n{common}\n{body}\n</code_ref>\n"
 
 SELF_CHECK_INSTRUCTIONS = """
 <self_check_before_return>
@@ -227,7 +231,7 @@ def _graph_type_from_keywords(question_user: str) -> str | None:
     if "scatter" in q or "phân tán" in q:
         return "scatter_2d_plot"
     if "table_plotly" in q or ("plotly" in q and "table" in q):
-        return "table_plotly"
+        return "table"
     if ("dataframe" in q and "table" in q) or ("bảng" in q and "dữ liệu" in q):
         return "table"
 
@@ -340,7 +344,7 @@ def _deprecated_define_graph_type(
     answer "scattermap_plot" if has in question (scatter map / points on map phrasing)
     answer "polar_plot" if has in question (radar / polar / spider chart phrasing)
     answer "table" if has in question (dataframe table, show as table phrasing)
-    answer "table_plotly" if has in question (plotly table phrasing)
+    answer "table" if has in question (dataframe / table phrasing including former plotly-table wording)
     answer "base_ref" if there is nothing related to the question.
     </allowed_words>
 
@@ -418,7 +422,7 @@ def process_prompt(
     questions_text = "\n".join([item["question"] for item in user_questions])
 
     graph_type = define_graph_type(llm, user_question, questions_text)
-    params_plot = _load_ragdata_code_ref(graph_type)
+    params_plot = _matplotlib_graph_hints(graph_type)
 
     try:
         rag_docs_context = build_rag_context(
@@ -466,7 +470,6 @@ def process_prompt(
         "choroplethmap_plot",
         "densitymap_plot",
         "scattermap_plot",
-        "table_plotly",
         "polar_plot",
         "surface_plot",
         "heatmap",
@@ -478,7 +481,8 @@ def process_prompt(
     ]:
         result_instruction = """
 # For plot-type answers:
-# - Create the Plotly figure (store it in a variable named `fig`).
+# - Draw with matplotlib/seaborn; capture the active figure as `fig = plt.gcf()` (or use the `fig` from plt.subplots).
+# - `fig` MUST be a matplotlib.figure.Figure (not pyplot module).
 # - Create a short Vietnamese analysis/insight string in a variable named `analysis`.
 # - The `analysis` MUST reference the computed values used in the chart (e.g., top-1 entity, highest/lowest value, or main comparison).
 # - Set `result = {"figure": fig, "analysis": analysis}`.
@@ -539,16 +543,14 @@ def process_prompt(
         {province_hint}
         {price_driver_hint}
         {intent_hint}
-        For plots, ONLY use the Plotly library and assign the figure to the result contract above.
-        Default template style: plotly, unless the user requests otherwise.
-        All visible text in titles, axis titles, legends, hovers, etc., MUST be in Vietnamese.
+        For plots, use matplotlib and seaborn only; assign a matplotlib Figure per the result contract above.
+        All visible text in titles, axis labels, legends, etc., MUST be in Vietnamese.
         Set the legend title from the data when not specified by the user.
         On the x and y axes, rotate long date or category labels to about 45 degrees when it improves readability.
-        Title color should follow the template defaults unless the user requests otherwise.
-        Derive "xaxis_title" and "yaxis_title" text from <main_question>, stripping odd symbols where sensible.
+        Derive axis label text from <main_question> where sensible.
         Derive the chart title from <main_question>.
         Follow the blocks below exactly, always driven by <main_question>.
-        Apply update_traces() and update_layout() using patterns in <code_ref> as a baseline for <main_question>.
+        Use patterns in <code_ref> as a baseline for <main_question>.
         {params_plot}"""
     elif graph_type == "table":
         result_instruction = """
@@ -564,7 +566,8 @@ def process_prompt(
 # - Set `result` to the final answer text (string) in Vietnamese.
 """
         prompt_context = f"""
-        For plots, ONLY use the Plotly library and assign the figure into the result variable per contract above.
+        If <main_question> only needs explanation or numbers without a chart, return a Vietnamese string in `result` and do not import plotting libraries unnecessarily.
+        If a chart is still appropriate, use matplotlib/seaborn and the dict contract with `fig` and `analysis` as above.
         {params_plot}"""
 
     print(f"\n\n{Fore.LIGHTGREEN_EX}STARTING RUNTIME...{Fore.RESET}")
@@ -588,8 +591,8 @@ def process_prompt(
         ```python
         # TODO: import the necessary dependencies.
         import pandas as pd
-        import plotly.express as px
-        import plotly.graph_objects as go
+        import matplotlib.pyplot as plt
+        import seaborn as sns
         ...
 
         df = pd.DataFrame(DF_*)
@@ -633,8 +636,6 @@ def process_prompt(
         </last_code>
 
 
-
-        Variable `GEOJSON: list[dict]` is already declared.
 
         Generate complete Python code and return the full updated code in a single fenced ```python block.
 

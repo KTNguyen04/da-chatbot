@@ -361,7 +361,8 @@ patsy==1.0.2
     # via statsmodels
 pillow==10.4.0
     # via streamlit
-plotly==5.22.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
     # via ai-datanalysis
 propcache==0.4.1
     # via

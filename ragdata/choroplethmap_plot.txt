@@ -1,27 +1,10 @@
-# Plot
-px.choropleth_mapbox(<SET EX: df = pd.DataFrame(DF_*)>,
-                     geojson=GEOJSON[0],
-                     locations=<SET>,
-                     color=<SET>,
-                     color_continuous_scale=<SET>,
-                     mapbox_style="dark",
-                     zoom=4,
-                     opacity=1.0,
-                     center=dict(lat=-19.30, lon=-45.46))
-
-# Configure update_layout
-update_layout(margin=dict(l=40, r=40, t=65, b=65),
-              clickmode='event+select',
-              width=800,
-              height=600,
-              plot_bgcolor=None,
-              paper_bgcolor=None,
-              title=dict(text=<SET>,
-                         font=dict(family="Open Sans, sans-serif"),
-                         x=0.05, font_size=20),
-              xaxis_title=dict(text=<SET>, font=dict(size=14)),
-              yaxis_title=dict(text=<SET>, font=dict(size=14)),
-              legend_title=dict(text=<SET>),)
-
-# Configure update_traces
-update_traces(hoverlabel=dict(bgcolor='#383838', font=dict(color='white')))
+# Choropleth-style question → use a horizontal bar chart by Province/region (no map geometry).
+# Example: counts or mean price per province.
+fig, ax = plt.subplots(figsize=(10, max(6, df['Province'].nunique() * 0.22)))
+agg = df.groupby('Province', as_index=False)['<METRIC_COL>'].mean().sort_values('<METRIC_COL>', ascending=True)
+sns.barplot(data=agg, y='Province', x='<METRIC_COL>', ax=ax, orient='h')
+ax.set_xlabel('...')
+ax.set_ylabel('Tỉnh/Thành phố')
+ax.set_title('...')
+plt.xticks(rotation=0)
+plt.tight_layout()

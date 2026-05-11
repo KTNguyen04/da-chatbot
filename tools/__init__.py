@@ -9,18 +9,23 @@ Each module should export:
 To add tools:
   1. Create tools/my_new_tools.py
   2. Define TOOL_DEFINITIONS + TOOL_FUNCTIONS
-  3. No other edits required — this registry picks them up on import.
+  3. If tools need the session DataFrame, define set_dataframe(df: pd.DataFrame) -> None
+     (registry collects it automatically; tool_executor injects into all hooks).
 """
 
 import importlib
 import pkgutil
 from pathlib import Path
 from typing import Optional, Callable
+
+import pandas as pd
 from colorama import Fore
 
 # ── Global registry ───────────────────────────────────────────────────────────
 ALL_TOOL_DEFINITIONS: list[dict] = []
 ALL_TOOL_FUNCTIONS: dict[str, callable] = {}
+# Each loaded module may expose set_dataframe(df) — called before tool runs.
+ALL_SET_DATAFRAME_HOOKS: list[Callable[[pd.DataFrame], None]] = []
 
 
 def _load_all_tools() -> None:
@@ -49,6 +54,10 @@ def _load_all_tools() -> None:
             ALL_TOOL_DEFINITIONS.extend(defs)
             ALL_TOOL_FUNCTIONS.update(funcs)
 
+            setter = getattr(mod, "set_dataframe", None)
+            if callable(setter):
+                ALL_SET_DATAFRAME_HOOKS.append(setter)
+
             print(
                 f"{Fore.LIGHTGREEN_EX}[ToolRegistry] Loaded '{module_name}': "
                 f"{len(defs)} tool(s) → {list(funcs.keys())}{Fore.RESET}"
@@ -72,3 +81,9 @@ def get_tool_definitions() -> list[dict]:
 def get_tool_function(name: str) -> Optional[Callable]:
     """Return the implementation for a tool name, or None if unknown."""
     return ALL_TOOL_FUNCTIONS.get(name)
+
+
+def inject_dataframe_into_all_tool_modules(df: pd.DataFrame) -> None:
+    """Push the active DataFrame into every tool module that registered set_dataframe."""
+    for hook in ALL_SET_DATAFRAME_HOOKS:
+        hook(df)
