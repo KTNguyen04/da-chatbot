@@ -35,12 +35,44 @@ def classify_intent(llm: object, question: str, history: str) -> dict:
     2. 'metadata_query': Hỏi về ý nghĩa dữ liệu, định nghĩa cột (ví dụ: "cột address là gì?", "giá tính bằng đơn vị nào?").
     3. 'general_chat': Chào hỏi, tán gẫu.
 
+    ## Intent Recognition
+
+    The user may phrase their questions in various ways, but the core intent
+    should be mapped to one of the two predefined analytical questions below.
+    Do not rely on exact keyword matching — instead, identify the semantic
+    meaning behind the user's input.
+
+    ### Predefined Intents
+
+    Intent 1 — Physical Structure vs. Price
+    Core meaning: The user wants to understand how measurable physical
+    attributes of a property (such as area, number of floors, bedrooms,
+    bathrooms, or frontage width) relate to or influence its selling price.
+
+    Intent 2 — Bigger = More Expensive?
+    Core meaning: The user wants to challenge or verify the assumption that
+    larger properties are always priced higher — looking for exceptions,
+    nuances, or non-linear relationships in the data.
+
+    ### Handling Ambiguous Input
+    If the user's message could reasonably map to either intent, or does
+    not clearly match either one, return analysis_intent='ambiguous' so the
+    assistant can ask a brief clarifying question.
+
     Trả về format JSON duy nhất:
     {{
         "intent": "data_analysis" | "metadata_query" | "general_chat",
-        "graph_type": "box_plot" | "bar_chart" | "treemap_plot" | "none",
-        "target_col": "tên cột liên quan hoặc none"
+        "graph_type": "scatter_2d_plot" | "box_plot" | "bar_plot" | "treemap_plot" | "none",
+        "target_col": "tên cột liên quan hoặc none",
+        "analysis_intent": "physical_structure_vs_price" | "bigger_equals_more_expensive" | "ambiguous" | "none"
     }}
+
+    Quy tắc chọn graph_type cho data_analysis:
+    - analysis_intent='physical_structure_vs_price' -> ưu tiên "scatter_2d_plot" (Area-Price),
+      hoặc "box_plot"/"bar_plot" nếu câu hỏi nhấn mạnh so sánh theo nhóm Floors/Bedrooms/Bathrooms/Frontage.
+    - analysis_intent='bigger_equals_more_expensive' -> ưu tiên "box_plot" (theo nhóm diện tích)
+      hoặc "scatter_2d_plot" để kiểm tra ngoại lệ.
+    - Nếu không phù hợp, dùng "none".
 
     Lịch sử: {history}
     Câu hỏi: {question}
@@ -55,7 +87,12 @@ def classify_intent(llm: object, question: str, history: str) -> dict:
             return json.loads(match.group())
     except:
         pass
-    return {"intent": "data_analysis", "graph_type": "none", "target_col": "none"}
+    return {
+        "intent": "data_analysis",
+        "graph_type": "none",
+        "target_col": "none",
+        "analysis_intent": "none",
+    }
 
 
 def define_graph_type(llm: object, question_user: str, hist_questions: str) -> str:
@@ -79,7 +116,20 @@ def define_graph_type(llm: object, question_user: str, hist_questions: str) -> s
 
     # Hàm này giờ gọi classify_intent để lấy graph_type
     res = classify_intent(llm, question_user, hist_questions)
-    return res.get("graph_type", "none")
+    analysis_intent = res.get("analysis_intent", "none")
+    graph_type = res.get("graph_type", "none")
+
+    if analysis_intent == "physical_structure_vs_price":
+        if any(k in q for k in ["số tầng", "tầng", "phòng ngủ", "phòng tắm", "mặt tiền", "frontage"]):
+            return "box_plot"
+        return "scatter_2d_plot"
+
+    if analysis_intent == "bigger_equals_more_expensive":
+        if any(k in q for k in ["luôn", "always", "ngoại lệ", "exception", "không phải lúc nào"]):
+            return "box_plot"
+        return "scatter_2d_plot"
+
+    return graph_type
 
 
 # Old function header replaced by new logic below
@@ -324,6 +374,22 @@ def process_prompt(
         # Bắt buộc nêu bằng chứng định lượng, ngoại lệ và kết luận có điều kiện.
         # Không khẳng định quan hệ nhân quả tuyệt đối, phải ghi rõ 'tương quan không đồng nghĩa nhân quả'.
         # Ưu tiên scatter (Area-Price) + so sánh nhóm theo Floors/Bedrooms/Bathrooms/Frontage.
+        """ if is_price_driver_question else ""}
+        {"""
+        # INTENT RECOGNITION:
+        # Map câu hỏi theo nghĩa ngữ nghĩa về 2 intent:
+        # (1) Physical Structure vs. Price
+        # (2) Bigger = More Expensive?
+        # Nếu mơ hồ giữa 2 intent, phải hỏi rõ người dùng trước khi kết luận.
+        #
+        # CHART SELECTION GUIDELINES:
+        # - Intent 1:
+        #   + Scatter 2D (Area vs Price) để thấy xu hướng liên tục.
+        #   + Box/Bar theo Floors/Bedrooms/Bathrooms/Frontage để so sánh nhóm cấu trúc.
+        # - Intent 2:
+        #   + Box plot theo nhóm diện tích để kiểm tra vùng chồng lấn giá giữa nhà nhỏ/lớn.
+        #   + Scatter 2D để chỉ ra các ngoại lệ (nhà nhỏ đắt hơn nhà lớn).
+        # Không dùng 1 biểu đồ duy nhất để kết luận tuyệt đối khi có ngoại lệ.
         """ if is_price_driver_question else ""}
         For plots, ONLY use the "Plotly" library and bring fig object into the result variable.
         The template should ONLY be "plotly", when not requested.

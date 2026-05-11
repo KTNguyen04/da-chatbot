@@ -309,6 +309,61 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── 10. Phân tích intent 1: kích thước/cấu trúc vs giá ───────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_property_structure_price_impact",
+            "description": (
+                "Phân tích mức ảnh hưởng của kích thước và cấu trúc nhà (Area, Floors, Bedrooms, "
+                "Bathrooms, Frontage) lên giá bán. Dùng cho intent: "
+                "'physical size and structure affect price'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "price_column": {
+                        "type": "string",
+                        "description": "Tên cột giá (mặc định: Price)",
+                        "default": "Price",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    # ── 11. Phân tích intent 2: nhà to hơn có luôn đắt hơn không ─────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_bigger_house_premium",
+            "description": (
+                "Đánh giá giả định 'nhà lớn hơn luôn đắt hơn' bằng nhóm diện tích, "
+                "so sánh giá trung vị và đo tỷ lệ ngoại lệ."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "area_column": {
+                        "type": "string",
+                        "description": "Tên cột diện tích (mặc định: Area)",
+                        "default": "Area",
+                    },
+                    "price_column": {
+                        "type": "string",
+                        "description": "Tên cột giá (mặc định: Price)",
+                        "default": "Price",
+                    },
+                    "bins": {
+                        "type": "integer",
+                        "description": "Số nhóm diện tích quantile (mặc định 5)",
+                        "default": 5,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -750,6 +805,109 @@ def structure_group_price_compare(
     }
 
 
+def analyze_property_structure_price_impact(price_column: str = "Price") -> dict[str, Any]:
+    """
+    Intent 1: đo ảnh hưởng của kích thước/cấu trúc tới giá.
+    """
+    drivers = analyze_price_drivers(target_column=price_column)
+    if "error" in drivers:
+        return drivers
+
+    structure = structure_group_price_compare(
+        group_columns=["Floors", "Bedrooms", "Bathrooms", "Frontage"],
+        price_column=price_column,
+        top_n=10,
+    )
+    if "error" in structure:
+        return structure
+
+    return {
+        "tool": "analyze_property_structure_price_impact",
+        "price_column": price_column,
+        "drivers_ranked": drivers.get("drivers_ranked", []),
+        "group_comparison": structure.get("comparison", {}),
+        "key_metrics": {
+            "top_driver": drivers.get("key_metrics", {}).get("top_driver"),
+            "top_driver_correlation": drivers.get("key_metrics", {}).get(
+                "top_driver_correlation"
+            ),
+            "strongest_grouping_signal": structure.get("key_metrics", {}).get(
+                "strongest_grouping_signal"
+            ),
+        },
+        "suggested_charts": ["scatter_2d_plot", "box_plot", "bar_plot"],
+        "chart_guidance": (
+            "Ưu tiên scatter_2d_plot để xem quan hệ Area-Price; "
+            "dùng box_plot/bar_plot để so sánh phân phối giá theo Floors/Bedrooms/Bathrooms/Frontage."
+        ),
+        "insight": (
+            "Phân tích tổng hợp cho thấy giá chịu tác động bởi cả biến liên tục (diện tích) "
+            "và biến cấu trúc theo nhóm (số tầng/phòng/mặt tiền)."
+        ),
+    }
+
+
+def analyze_bigger_house_premium(
+    area_column: str = "Area", price_column: str = "Price", bins: int = 5
+) -> dict[str, Any]:
+    """
+    Intent 2: kiểm chứng 'nhà to hơn có luôn đắt hơn không'.
+    """
+    summary = price_vs_size_summary(
+        area_column=area_column, price_column=price_column, bins=bins
+    )
+    if "error" in summary:
+        return summary
+
+    df = _require_df()
+    work = df[[area_column, price_column]].copy()
+    work[area_column] = pd.to_numeric(work[area_column], errors="coerce")
+    work[price_column] = pd.to_numeric(work[price_column], errors="coerce")
+    work = work.dropna().sort_values(area_column)
+    if len(work) < 10:
+        return {"error": "Không đủ dữ liệu để kiểm chứng giả định diện tích và giá."}
+
+    # Tỷ lệ ngoại lệ cục bộ: điểm sau có diện tích lớn hơn nhưng giá thấp hơn điểm trước.
+    area_vals = work[area_column].values
+    price_vals = work[price_column].values
+    violation_count = 0
+    comparisons = 0
+    for i in range(1, len(work)):
+        if area_vals[i] > area_vals[i - 1]:
+            comparisons += 1
+            if price_vals[i] < price_vals[i - 1]:
+                violation_count += 1
+    violation_rate = round((violation_count / comparisons) * 100, 2) if comparisons else 0.0
+
+    monotonic = summary.get("key_metrics", {}).get(
+        "monotonic_non_decreasing_median_price", False
+    )
+    conclusion = (
+        "Nhà lớn hơn thường có giá cao hơn, nhưng không phải lúc nào cũng đúng."
+        if not monotonic or violation_rate > 0
+        else "Trong dữ liệu hiện tại, giá trung vị tăng theo diện tích và ít thấy ngoại lệ."
+    )
+
+    return {
+        "tool": "analyze_bigger_house_premium",
+        "area_column": area_column,
+        "price_column": price_column,
+        "bins_used": summary.get("bins_used"),
+        "size_price_summary": summary.get("records", []),
+        "key_metrics": {
+            "monotonic_non_decreasing_median_price": monotonic,
+            "local_price_violation_rate_percent": violation_rate,
+            "pairwise_comparisons": comparisons,
+        },
+        "suggested_charts": ["box_plot", "scatter_2d_plot", "bar_plot"],
+        "chart_guidance": (
+            "Dùng box_plot theo size_bin để kiểm tra chồng lấn phân phối giá; "
+            "dùng scatter_2d_plot để nhìn ngoại lệ; bar_plot để tóm tắt median theo nhóm diện tích."
+        ),
+        "insight": conclusion,
+    }
+
+
 # ── Export cho registry ───────────────────────────────────────────────────────
 TOOL_FUNCTIONS: dict[str, callable] = {
     "get_province_ranking": get_province_ranking,
@@ -761,4 +919,6 @@ TOOL_FUNCTIONS: dict[str, callable] = {
     "analyze_price_drivers": analyze_price_drivers,
     "price_vs_size_summary": price_vs_size_summary,
     "structure_group_price_compare": structure_group_price_compare,
+    "analyze_property_structure_price_impact": analyze_property_structure_price_impact,
+    "analyze_bigger_house_premium": analyze_bigger_house_premium,
 }

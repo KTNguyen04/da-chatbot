@@ -73,8 +73,10 @@ def _build_system_prompt(user_question: str = "") -> str:
     if any(kw in q for kw in price_driver_keywords) and ("giá" in q or "price" in q):
         price_driver_note = (
             "\n⚡ Câu hỏi này thuộc nhóm price drivers → "
-            "Ưu tiên gọi lần lượt `analyze_price_drivers`, `price_vs_size_summary`, "
-            "`structure_group_price_compare` để có insight đa góc nhìn.\n"
+            "Ưu tiên gọi `analyze_property_structure_price_impact` cho intent "
+            "'Physical Structure vs. Price' và `analyze_bigger_house_premium` cho intent "
+            "'Bigger = More Expensive?'. Có thể bổ sung `analyze_price_drivers`, "
+            "`price_vs_size_summary`, `structure_group_price_compare` để đối chiếu.\n"
         )
 
     return (
