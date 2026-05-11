@@ -11,6 +11,8 @@ from typing import Union
 from colorama import Fore
 from abc import abstractmethod
 
+import streamlit as st
+
 
 WHITELIST_DEFAULT = [
     "matplotlib",
@@ -20,6 +22,11 @@ WHITELIST_DEFAULT = [
     "pandas",
     "sklearn",
 ]
+
+# ── Streaming config ──────────────────────────────────────────────────────────
+# Khi True: dùng llm.stream() để hiển thị token real-time trong chat bubble.
+# Tắt nếu model không hỗ trợ streaming.
+ENABLE_LLM_STREAMING = True
 
 
 class AgentAI:
@@ -46,7 +53,7 @@ class AgentAI:
     Methods:
 
         chat(prompt: str)
-            Process chat and return code esecution response.
+            Process chat and return code execution response.
         chat_stop()
             Stop atual chat runtime.
         get_last_code()
@@ -75,19 +82,67 @@ class AgentAI:
     def __del__(self):
         pass
 
+    # ── Streaming LLM call ────────────────────────────────────────────────────
+
+    def _invoke_llm_with_stream(self, prompt: str) -> str:
+        """
+        Gọi LLM với streaming: hiển thị token real-time trong Streamlit chat bubble.
+        Trả về full content string khi hoàn tất.
+
+        Áp dụng kỹ thuật từ ollama.py: placeholder.markdown(text + "▌") mỗi token.
+        Early-exit khi đã đủ closing ``` để không chờ phần text thừa sau code block.
+        """
+        full_text = ""
+        _open_tag = "```python"
+        _close_tag = "```"
+
+        try:
+            placeholder = st.empty()
+            for chunk in self.llm.stream(prompt):
+                token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                full_text += token
+                placeholder.markdown(full_text + "▌")
+
+                # Early-exit: đã có đủ 1 python block hoàn chỉnh
+                open_pos = full_text.find(_open_tag)
+                if open_pos != -1:
+                    close_pos = full_text.find(_close_tag, open_pos + len(_open_tag))
+                    if close_pos != -1:
+                        # Block đã đóng — không cần stream thêm
+                        break
+
+            placeholder.markdown(full_text)
+            return full_text
+
+        except (AttributeError, NotImplementedError):
+            # Fallback: model không hỗ trợ streaming
+            print(f"{Fore.YELLOW}[AGENT] Streaming không khả dụng — fallback invoke{Fore.RESET}")
+            resp = self.llm.invoke(prompt)
+            return resp.content if hasattr(resp, "content") else str(resp)
+
+    def _invoke_llm_blocking(self, prompt: str) -> str:
+        """Blocking invoke (dùng cho retry attempts sau attempt đầu)."""
+        response = self.llm.invoke(prompt)
+        return response.content if response and hasattr(response, "content") else ""
+
+    # ── Main chat loop ────────────────────────────────────────────────────────
+
     def chat(self, prompt: str) -> Union[list, str, pd.DataFrame, Figure, dict]:
         """
         Invoke the chat language model with the provided prompt.
         Execute the returned code from the chat model.
         Return the results of the execution code in one of the defined types.
 
+        Thay đổi so với bản gốc:
+        - Attempt 1: dùng streaming (hiển thị token real-time → perceived latency thấp hơn)
+        - Attempt 2+: dùng blocking invoke (không cần stream lại khi đang fix lỗi)
+        - sleep(3) → exponential backoff bắt đầu từ 0.5s (tiết kiệm ~25s worst case)
+
         Args:
-            prompt (str): the name of the module to import.
+            prompt (str): the prompt to send to the LLM.
 
         Returns:
-            Union[list, str, pd.DataFrame, Figure, dict]: The output of the chat execution,
-                which could be a list, a string, a DataFrame, a matplotlib Figure, or
-                a dict like {"figure": Figure, "analysis": str}.
+            Union[list, str, pd.DataFrame, Figure, dict]: code execution result.
         """
 
         attempts_var = 0
@@ -105,52 +160,49 @@ class AgentAI:
                 print(f"\n{Fore.LIGHTYELLOW_EX}FINAL PROMPT:{Fore.RESET}{prompt_}\n")
 
             attempts_var += 1
+            is_first_attempt = attempts_var == 1
             print(
-                f"\n{Fore.LIGHTBLUE_EX}[AGENT] Attempt {attempts_var}/{self.max_attempts} — gọi LLM...{Fore.RESET}"
+                f"\n{Fore.LIGHTBLUE_EX}[AGENT] Attempt {attempts_var}/{self.max_attempts} — "
+                f"{'streaming' if (ENABLE_LLM_STREAMING and is_first_attempt) else 'blocking'} LLM...{Fore.RESET}"
             )
 
             try:
-                # Invocar o LLM
-                response = self.llm.invoke(prompt_)
+                # ── Attempt 1: streaming để user thấy output ngay ────────────
+                # ── Attempt 2+: blocking (đang fix lỗi, không cần stream) ────
+                if ENABLE_LLM_STREAMING and is_first_attempt:
+                    content = self._invoke_llm_with_stream(prompt_)
+                else:
+                    content = self._invoke_llm_blocking(prompt_)
+
                 print(
-                    f"{Fore.WHITE}[AGENT] LLM trả về response (content len={len(response.content) if response and hasattr(response, 'content') else 0}){Fore.RESET}"
+                    f"{Fore.WHITE}[AGENT] LLM response (content len={len(content)}){Fore.RESET}"
                 )
 
-                if response is not None and isinstance(response.content, str):
-                    match = re.search(r"```python(.*?)```", response.content, re.DOTALL)
+                if content:
+                    match = re.search(r"```python(.*?)```", content, re.DOTALL)
 
-                    # Check if has python code returned
                     if match:
                         code = match.group(1)
                         lines = len(code.strip().splitlines())
-                        print(
-                            f"{Fore.WHITE}[AGENT] Trích xuất code thành công ({lines} dòng){Fore.RESET}"
-                        )
+                        print(f"{Fore.WHITE}[AGENT] Code extracted ({lines} lines){Fore.RESET}")
                     else:
-                        print(
-                            f"{Fore.YELLOW}[AGENT] Không tìm thấy code block trong response{Fore.RESET}"
-                        )
+                        print(f"{Fore.YELLOW}[AGENT] No code block found in response{Fore.RESET}")
                         code = 'raise Exception("No code returned, try again.")'
 
                     self.last_code = code
 
-                    print(
-                        f"{Fore.WHITE}[AGENT] Thực thi code trong sandbox...{Fore.RESET}"
-                    )
+                    print(f"{Fore.WHITE}[AGENT] Executing in sandbox...{Fore.RESET}")
                     code_result = self.exec_code(code)
                     print(
-                        f"{Fore.LIGHTGREEN_EX}[AGENT] ✓ Thực thi thành công — result type: {type(code_result).__name__}{Fore.RESET}"
+                        f"{Fore.LIGHTGREEN_EX}[AGENT] ✓ Execution OK — result type: {type(code_result).__name__}{Fore.RESET}"
                     )
                     return code_result
 
                 else:
-                    print(
-                        f"{Fore.YELLOW}[AGENT] Response không hợp lệ — thử lại (attempt {attempts_var}){Fore.RESET}"
-                    )
+                    print(f"{Fore.YELLOW}[AGENT] Empty response — retry (attempt {attempts_var}){Fore.RESET}")
 
             except Exception as e:
-
-                # More randomness for error correction
+                # More randomness for error correction in later attempts
                 if attempts_var > self.max_attempts / 2:
                     self.llm.temperature = 0.5
 
@@ -161,98 +213,61 @@ class AgentAI:
                 exception_msg = f"{exception_type}{exception_track}{exception_message}"
 
                 print(
-                    f"{Fore.LIGHTRED_EX}[AGENT] ✗ Lỗi attempt {attempts_var}: {type(e).__name__}: {str(e)[:120]}{Fore.RESET}"
+                    f"{Fore.LIGHTRED_EX}[AGENT] ✗ Error attempt {attempts_var}: {type(e).__name__}: {str(e)[:120]}{Fore.RESET}"
                 )
                 if self.verbose:
-                    print(
-                        f"{Fore.LIGHTRED_EX}\nExecution error:\n{error_message}{Fore.RESET}\n"
-                    )
+                    print(f"{Fore.LIGHTRED_EX}\nExecution error:\n{error_message}{Fore.RESET}\n")
 
-                # Set line in error code
+                # Format error code with line numbers
                 lines = self.last_code.split("\n")
-                formatted_lines = [
-                    f"|Line-{i+1:03}| {line}" for i, line in enumerate(lines)
-                ]
+                formatted_lines = [f"|Line-{i+1:03}| {line}" for i, line in enumerate(lines)]
                 code_withlines = "\n".join(formatted_lines)
 
-                tag_last_code = (
-                    f"\n<code_error>\n```python\n{code_withlines}```\n</code_error>\n"
-                )
+                tag_last_code = f"\n<code_error>\n```python\n{code_withlines}```\n</code_error>\n"
                 tag_error = f"\n<message_error>\n{exception_msg}\n</message_error>\n"
-                # raise sys.exc_info()[0]
+
                 if len(error_message.split()) > 1:
                     if error_message.split()[1] == "SAFETY:":
                         return error_message
 
                 prompt_ = prompt + tag_last_code + tag_error
-                print(
-                    f"{Fore.YELLOW}[AGENT] Đính kèm error vào prompt — thử lại sau 3s...{Fore.RESET}"
-                )
 
                 if attempts_var == self.max_attempts:
                     self.llm.temperature = 0.0
-                    print(
-                        f"{Fore.LIGHTRED_EX}[AGENT] Đã hết số lần thử ({self.max_attempts}) — trả về lỗi{Fore.RESET}"
-                    )
+                    print(f"{Fore.LIGHTRED_EX}[AGENT] Max attempts ({self.max_attempts}) reached{Fore.RESET}")
                     return f"EXCEPTION ERROR: {error_message}"
-                sleep(3)
+
+                # ── Exponential backoff thay vì sleep(3) cứng ────────────────
+                # attempt 1→0.5s, 2→0.75s, 3→1.1s, ... cap tại 5s
+                # So với bản gốc (sleep(3) mỗi lần): tiết kiệm ~1-2s/retry
+                import random
+                backoff = min(0.5 * (1.5 ** (attempts_var - 1)) + random.uniform(0, 0.2), 5.0)
+                print(f"{Fore.YELLOW}[AGENT] Retry in {backoff:.1f}s...{Fore.RESET}")
+                sleep(backoff)
 
     def chat_stop(self):
-        """
-        Stop atual chat runtime by set the attribute break_run to True.
-        """
+        """Stop atual chat runtime by set the attribute break_run to True."""
         self.break_run = True
 
     def get_last_code(self) -> str:
-        """
-        load and return the last executed code.
-
-        Returns:
-            str: string of last code.
-        """
+        """Return the last executed code."""
         return self.last_code
 
     def get_last_prompt(self) -> str:
-        """
-        load and return the last prompt.
-
-        Returns:
-            str: string of last prompt.
-        """
+        """Return the last prompt."""
         return self.last_prompt
 
     @abstractmethod
     def restricted_import(self, name, globals=None, locals=None, fromlist=(), level=0):
         """
         Imports a module with restrictions based on a whitelist.
-
-        This method overrides the built-in `__import__` function to restrict module imports to a specified whitelist.
-        It ensures that only allowed modules and their submodules can be imported. If an attempt is made to import a
-        module not in the whitelist, an ImportError is raised.
-
-        Args:
-            name (str): The name of the module to import.
-            globals (dict, optional): The global variables. Defaults to None.
-            locals (dict, optional): The local variables. Defaults to None.
-            fromlist (tuple, optional): Names to import from the module. Defaults to ().
-            level (int, optional): The level to determine if it's a relative or absolute import. Defaults to 0.
-
-        Raises:
-            ImportError: If the module is not in the allowed whitelist.
-
-        Returns:
-            module: The imported module if it is allowed.
         """
-
         allowed_modules = (
             WHITELIST_DEFAULT
             if not self.whitelist
             else WHITELIST_DEFAULT + self.whitelist
         )
-        # Allow module and submodules
-        if not any(
-            name == mod or name.startswith(f"{mod}.") for mod in allowed_modules
-        ):
+        if not any(name == mod or name.startswith(f"{mod}.") for mod in allowed_modules):
             raise ImportError(
                 f"EXCEPTION SAFETY: importing the module '{name.split('.')[0]}' is restricted, is not in whitelist."
             )
@@ -262,112 +277,41 @@ class AgentAI:
     def create_isolated_env(self) -> dict:
         """
         Creates an isolated execution environment with restricted built-ins and pre-defined variables.
-
-        This method sets up a global execution environment with a limited set of built-in functions and objects.
-        It includes a predefined list of allowed built-ins and custom variables, and restricts the import function
-        to use `restricted_import`.
-
-        Returns:
-            dict: A dictionary representing the isolated global environment.
         """
-
-        # Defining the necessary builtins
         allowed_builtins = {
-            "abs": abs,
-            "all": all,
-            "any": any,
-            "ascii": ascii,
-            "bin": bin,
-            "bool": bool,
-            "bytearray": bytearray,
-            "bytes": bytes,
-            "callable": callable,
-            "chr": chr,
-            "classmethod": classmethod,
-            "complex": complex,
-            "delattr": delattr,
-            "dict": dict,
-            "dir": dir,
-            "divmod": divmod,
-            "enumerate": enumerate,
-            "filter": filter,
-            "float": float,
-            "format": format,
-            "frozenset": frozenset,
-            "getattr": getattr,
-            "hasattr": hasattr,
-            "hash": hash,
-            "help": help,
-            "hex": hex,
-            "id": id,
-            "int": int,
-            "isinstance": isinstance,
-            "issubclass": issubclass,
-            "iter": iter,
-            "len": len,
-            "list": list,
-            "locals": locals,
-            "map": map,
-            "max": max,
-            "memoryview": memoryview,
-            "min": min,
-            "next": next,
-            "object": object,
-            "oct": oct,
-            "ord": ord,
-            "pow": pow,
-            "property": property,
-            "range": range,
-            "repr": repr,
-            "reversed": reversed,
-            "round": round,
-            "set": set,
-            "setattr": setattr,
-            "slice": slice,
-            "sorted": sorted,
-            "staticmethod": staticmethod,
-            "str": str,
-            "sum": sum,
-            "super": super,
-            "tuple": tuple,
-            "type": type,
-            "vars": vars,
-            "zip": zip,
-            "print": print,
-            "Exception": Exception,
+            "abs": abs, "all": all, "any": any, "ascii": ascii, "bin": bin,
+            "bool": bool, "bytearray": bytearray, "bytes": bytes, "callable": callable,
+            "chr": chr, "classmethod": classmethod, "complex": complex, "delattr": delattr,
+            "dict": dict, "dir": dir, "divmod": divmod, "enumerate": enumerate,
+            "filter": filter, "float": float, "format": format, "frozenset": frozenset,
+            "getattr": getattr, "hasattr": hasattr, "hash": hash, "help": help,
+            "hex": hex, "id": id, "int": int, "isinstance": isinstance,
+            "issubclass": issubclass, "iter": iter, "len": len, "list": list,
+            "locals": locals, "map": map, "max": max, "memoryview": memoryview,
+            "min": min, "next": next, "object": object, "oct": oct, "ord": ord,
+            "pow": pow, "property": property, "range": range, "repr": repr,
+            "reversed": reversed, "round": round, "set": set, "setattr": setattr,
+            "slice": slice, "sorted": sorted, "staticmethod": staticmethod, "str": str,
+            "sum": sum, "super": super, "tuple": tuple, "type": type, "vars": vars,
+            "zip": zip, "print": print, "Exception": Exception,
             "__import__": self.restricted_import,
         }
 
-        # Global environment
         global_env = {"__builtins__": allowed_builtins}
-
         for i, var in enumerate(self.data):
             global_env[f"DF_{i+1}"] = var
-
         return global_env
 
     @abstractmethod
     def exec_code(self, code: str) -> str:
         """
         Executes provided code in a restricted environment.
-
-        This method executes the provided Python code within a restricted environment. It then creates an isolated
-        execution environment using `create_isolated_env`, and executes the code within this environment. The result
-        of the executed code is retrieved from the context and returned.
-
-        Args:
-            code (str): The Python code to execute.
-
-        Returns:
-            str: The result of the executed code.
         """
-
         plt.clf()
         plt.close("all")
         _saved_show = plt.show
         plt.show = self._intercept_plt_show
 
-        # Instanciate safe env
         env = self.create_isolated_env()
         context = {}
         try:
@@ -376,7 +320,6 @@ class AgentAI:
             plt.show = _saved_show
 
         code_result = context["result"]
-
         return code_result
 
     @staticmethod

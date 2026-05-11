@@ -1,0 +1,26 @@
+{
+  "id": "2026-05-11_15-01-45",
+  "savedAt": "2026-05-11T15:01:45.584450",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello",
+      "type": "text"
+    },
+    {
+      "role": "assistant",
+      "content": "Chào bạn! Mình có thể giúp bạn:\n- Xem thông tin/tên các cột trong dataset\n- Vẽ biểu đồ và phân tích quan hệ giữa các biến\n- Trả lời các câu hỏi liên quan đến dữ liệu\n\nBạn muốn bắt đầu với cột nào hoặc kiểu biểu đồ nào?",
+      "type": "text"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "type": "text"
+    },
+    {
+      "role": "assistant",
+      "content": "Chào bạn! Mình có thể giúp bạn:\n- Xem thông tin/tên các cột trong dataset\n- Vẽ biểu đồ và phân tích quan hệ giữa các biến\n- Trả lời các câu hỏi liên quan đến dữ liệu\n\nBạn muốn bắt đầu với cột nào hoặc kiểu biểu đồ nào?",
+      "type": "text"
+    }
+  ]
+}

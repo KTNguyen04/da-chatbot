@@ -25,12 +25,95 @@ from typing import Any, Optional, List
 import tools  # auto-load tất cả tool modules qua registry
 from tools import get_tool_definitions, get_tool_function, inject_dataframe_into_all_tool_modules
 
-TOOL_TIMEOUT = 30  # giây chờ LLM phản hồi (fail fast; tăng nếu model chậm)
-MAX_TOOL_ROUNDS = 5  # số vòng tool-calling tối đa (EDA thường cần nhiều bước)
+TOOL_TIMEOUT_FIRST = 90   # giây cho round đầu (cold start + model load)
+TOOL_TIMEOUT_RETRY = 60   # giây cho các round tiếp theo (model đã warm)
+TOOL_TIMEOUT = 90         # fallback / legacy alias
+MAX_TOOL_ROUNDS = 3       # giảm từ 5 → 3: tránh tích lũy timeout, đủ cho EDA thông thường
 
 MAX_TOOL_MESSAGE_JSON_CHARS = 22_000
 MAX_TOOL_LIST_ITEMS = 40
 MAX_TOOL_STRING_CHARS = 4_000
+
+# ── Tool routing: keyword → tool names ────────────────────────────────────────
+# Mỗi "nhóm" gồm các tools đủ để trả lời một loại câu hỏi.
+# Câu hỏi khớp nhiều nhóm → union. Không khớp nhóm nào → fallback 5 tools cốt lõi.
+_TOOL_ROUTE_TABLE: list[tuple[list[str], list[str]]] = [
+    (["tỉnh", "thành phố", "province", "city", "khu vực", "vùng", "phân bố tỉnh"],
+     ["get_province_ranking", "compare_mean_by_group"]),
+
+    (["giá", "price", "price_per_m2", "giá/m2", "đắt", "rẻ", "tốn", "chi phí"],
+     ["describe_numeric_column", "compare_mean_by_group", "filter_and_summarize", "detect_outliers"]),
+
+    (["diện tích", "area", "lớn", "nhỏ", "m2", "rộng", "hẹp"],
+     ["price_vs_size_summary", "analyze_bigger_house_premium", "describe_numeric_column"]),
+
+    (["phòng ngủ", "bedroom", "phòng tắm", "bathroom", "tầng", "floor", "mặt tiền", "frontage",
+      "cấu trúc", "structure", "lớn hơn", "to hơn"],
+     ["structure_group_price_compare", "analyze_property_structure_price_impact", "compare_mean_by_group"]),
+
+    (["yếu tố", "ảnh hưởng", "tác động", "driver", "tương quan", "correlation", "quan hệ"],
+     ["analyze_price_drivers", "numeric_correlation_pairs", "analyze_property_structure_price_impact"]),
+
+    (["lọc", "filter", "tìm", "search", "điều kiện", "condition", "bao nhiêu nhà"],
+     ["filter_rows", "filter_and_summarize", "count_by_category"]),
+
+    (["thống kê", "mô tả", "describe", "trung bình", "mean", "trung vị", "median",
+      "min", "max", "phân phối", "distribution"],
+     ["describe_numeric_column", "profile_column", "get_data_profile"]),
+
+    (["pháp lý", "legal", "sổ đỏ", "chứng nhận", "certificate", "nội thất", "furniture",
+      "hướng", "direction", "loại", "category", "tỷ lệ", "proportion", "mix"],
+     ["count_by_category", "compare_mean_by_group", "filter_and_summarize"]),
+
+    (["ngoại lệ", "outlier", "bất thường", "extreme", "cao bất thường", "thấp bất thường"],
+     ["detect_outliers", "profile_column"]),
+
+    (["cột", "column", "schema", "dataset", "dữ liệu gồm", "có những gì", "overview"],
+     ["get_data_profile"]),
+
+    (["so sánh", "compare", "khác nhau", "difference", "hơn", "kém"],
+     ["compare_mean_by_group", "compare_two_groups_stat_test", "pivot_summary"]),
+]
+
+_FALLBACK_TOOLS = [
+    "describe_numeric_column",
+    "compare_mean_by_group",
+    "filter_and_summarize",
+    "get_data_profile",
+    "analyze_price_drivers",
+]
+
+_MAX_TOOLS_PER_REQUEST = 5  # không gửi quá 5 tools / request
+
+
+def _route_tools(question: str) -> list[dict]:
+    """
+    Chọn subset tool definitions phù hợp với câu hỏi dựa trên keyword matching.
+    Trả về tối đa _MAX_TOOLS_PER_REQUEST tools theo thứ tự ưu tiên.
+    """
+    q_lower = question.lower()
+    matched: list[str] = []
+
+    for keywords, tool_names in _TOOL_ROUTE_TABLE:
+        if any(kw in q_lower for kw in keywords):
+            for t in tool_names:
+                if t not in matched:
+                    matched.append(t)
+
+    if not matched:
+        matched = list(_FALLBACK_TOOLS)
+
+    matched = matched[:_MAX_TOOLS_PER_REQUEST]
+
+    all_defs = get_tool_definitions()
+    name_to_def = {d["function"]["name"]: d for d in all_defs if "function" in d}
+    selected = [name_to_def[n] for n in matched if n in name_to_def]
+
+    # Nếu routing không match tool nào tồn tại → fallback toàn bộ capped
+    if not selected:
+        selected = all_defs[:_MAX_TOOLS_PER_REQUEST]
+
+    return selected
 
 
 # ── Inject DataFrame vào tất cả tool modules ──────────────────────────────────
@@ -115,26 +198,18 @@ def _tool_result_to_llm_json(tool_result: Any) -> str:
 
 
 # ── Build system prompt ────────────────────────────────────────────────────────
-def _build_system_prompt(df: Optional[pd.DataFrame] = None) -> str:
-    """English system instructions; model must still answer end users in Vietnamese."""
-    tool_names = [
-        t["function"]["name"]
-        for t in get_tool_definitions()
-        if "function" in t
-    ]
+def _build_system_prompt(df: Optional[pd.DataFrame] = None, tool_names: Optional[list[str]] = None) -> str:
+    """Compact system prompt. Tool list passed separately to avoid repetition."""
+    col_names = list(df.columns) if df is not None else []
+    shape = f"{len(df):,}r×{len(df.columns)}c" if df is not None else "unknown"
 
-    brief = ""
-    if df is not None and len(df.columns):
-        brief = f"<dataset>\n{_dataset_brief(df)}\n</dataset>\n\n"
+    names_str = ", ".join(tool_names) if tool_names else "see tools"
 
     return (
-        "You analyze the user's loaded table using the tools below. Pick tools from the question "
-        "and <dataset>; chain calls when needed.\n"
-        f"{brief}"
-        f"Tools: {', '.join(tool_names)}\n\n"
-        "Rules: If schema is unclear → `get_data_profile` first. Need exact numbers → call tools, "
-        "never invent. After tools, reply in Vietnamese (~200 words max), focused, with key "
-        "numbers highlighted (e.g. markdown bold).\n"
+        f"You are a data analyst. Dataset: {shape}, columns: {col_names}.\n"
+        f"Available tools: {names_str}.\n"
+        "Call the most relevant tool(s) for the question, then reply in Vietnamese (~150 words), "
+        "citing key numbers in **bold**. Never invent numbers — only use tool results."
     )
 
 
@@ -146,6 +221,7 @@ def _call_ollama(
     model: str,
     temperature: float = 0.1,
     verbose: bool = False,
+    timeout: int = TOOL_TIMEOUT_FIRST,
 ) -> dict:
     url = f"{ollama_base_url.rstrip('/')}/api/chat"
     payload: dict[str, Any] = {
@@ -158,9 +234,9 @@ def _call_ollama(
         payload["tools"] = tools
 
     if verbose:
-        print(f"\n{Fore.LIGHTCYAN_EX}[ToolExecutor] POST {url} | tools={len(tools or [])}{Fore.RESET}")
+        print(f"\n{Fore.LIGHTCYAN_EX}[ToolExecutor] POST {url} | tools={len(tools or [])} | timeout={timeout}s{Fore.RESET}")
 
-    resp = requests.post(url, json=payload, timeout=TOOL_TIMEOUT)
+    resp = requests.post(url, json=payload, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -240,18 +316,23 @@ def run_tool_insight(
     # ── Inject df vào tất cả tool modules ────────────────────────────────────
     _inject_dataframe(df)
 
-    tool_defs = get_tool_definitions()
+    # ── Route: chọn tools phù hợp với câu hỏi (tối đa _MAX_TOOLS_PER_REQUEST) ──
+    tool_defs = _route_tools(user_question)
+    tool_names_selected = [t["function"]["name"] for t in tool_defs if "function" in t]
+
+    print(
+        f"{Fore.LIGHTCYAN_EX}[ToolExecutor] Routed {len(tool_defs)}/{len(get_tool_definitions())} tools: "
+        f"{tool_names_selected}{Fore.RESET}"
+    )
+
     if not tool_defs:
         return "⚠️ Không có tool nào được đăng ký."
 
     messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt(df)},
+        {"role": "system", "content": _build_system_prompt(df, tool_names_selected)},
         {
             "role": "user",
-            "content": (
-                f"Question (Vietnamese): {user_question}\n\n"
-                "Call tool(s) for exact figures, then answer in Vietnamese only."
-            ),
+            "content": f"{user_question}\n\nAnswer in Vietnamese only.",
         },
     ]
 
@@ -261,12 +342,14 @@ def run_tool_insight(
             print(f"\n{Fore.LIGHTBLUE_EX}[ToolExecutor] Round {round_idx + 1}/{MAX_TOOL_ROUNDS}{Fore.RESET}")
 
         try:
+            timeout = TOOL_TIMEOUT_FIRST if round_idx == 0 else TOOL_TIMEOUT_RETRY
             response = _call_ollama(
                 messages=messages,
                 tools=tool_defs,
                 ollama_base_url=ollama_base_url,
                 model=model,
                 verbose=verbose,
+                timeout=timeout,
             )
         except requests.exceptions.ConnectionError:
             return f"⚠️ Không thể kết nối Ollama tại '{ollama_base_url}'."
@@ -315,5 +398,3 @@ def run_tool_insight(
         if last_content
         else "⚠️ Đã đạt giới hạn vòng lặp tool-calling mà không có insight cuối cùng."
     )
-
-

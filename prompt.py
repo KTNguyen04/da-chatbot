@@ -2,9 +2,13 @@
 """
 Prompt builder with RAG docs (ChromaDB).
 
-Uses rag_docs_manager in process_prompt(); chart code is guided with short,
-task-agnostic rules so the model picks matplotlib/seaborn visuals from the
-question and dtypes.
+Tối ưu so với phiên bản gốc:
+- Metadata được cache vào st.session_state theo id(df) → bỏ df.info() + df.sample() lặp lại
+- df.info() đầy đủ được thay bằng bảng col|dtype|nulls gọn hơn (~50% tokens)
+- N_SAMPLES giảm từ 5 → 2 rows
+- STRICT_PROMPT_RULES và SELF_CHECK_INSTRUCTIONS rút gọn
+- Lịch sử hội thoại chỉ gửi 5 câu gần nhất thay vì toàn bộ
+- classify_intent (LLM call trong process_prompt) vẫn giữ nguyên
 """
 
 import traceback
@@ -17,71 +21,106 @@ from rag_docs_manager import build_rag_context
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-# All model instructions are in English for clarity.
-# Only end-user–visible output (chart labels, analysis text, result strings) must be Vietnamese.
+
 VIETNAMESE_USER_FACING_OUTPUT = (
-    "All user-visible text (chart titles, axis labels, legends, `analysis`, `result`) → Vietnamese. "
+    "CRITICAL: The `analysis` string MUST be written in Vietnamese only. No English in `analysis`. "
+    "All user-visible text (chart titles, axis labels, legends, `result` strings) → Vietnamese. "
     "Variable names and code comments → English."
 )
 
-STRICT_PROMPT_RULES = """<strict_rules>
-- Use only columns in <metadata>; never invent values or access network/files.
-  Missing column → Vietnamese string in `result` explaining it.
-- matplotlib/seaborn only; NEVER plt.show(); call fig.tight_layout() before result.
-- For price vs. drivers: cite chart numbers, flag outliers, note correlation ≠ causation.
-</strict_rules>"""
+# ── Rút gọn rules: bỏ các chú thích dài, giữ lại điều cốt lõi ──────────────
+STRICT_PROMPT_RULES = """<rules>
+- Use only columns in <meta>. Missing col → Vietnamese string in result.
+- matplotlib/seaborn only; NO plt.show(); fig.tight_layout() before result.
+- Price vs drivers: cite numbers, flag outliers, note correlation≠causation.
+</rules>"""
+
+SELF_CHECK_INSTRUCTIONS = """<check>columns exist; no hardcoded values; result type correct; no plt.show(); no I/O.</check>"""
+
+# Số dòng sample tối đa gửi vào prompt (giảm từ 5 → 2)
+_PROMPT_SAMPLE_ROWS = 2
+
+# Số câu hỏi lịch sử tối đa gửi vào prompt
+_MAX_HISTORY_TURNS = 5
 
 
 def _matplotlib_graph_hints() -> str:
+    # Rút gọn so với bản gốc (~40% ít token hơn), giữ đủ thông tin để LLM chọn chart
     return """<chart_hints>
-fig, ax = plt.subplots(figsize=(...)); fig.tight_layout() before result.
-Pick by dtype+intent: cat-dist→bar(horiz if >8); num-dist→hist/violin;
-2-num→scatter; cat-vs-num→box/violin; part-whole→pie(≤6,+Khác); time→line;
-corr-matrix→heatmap(annot=True,fmt=".2f"); unsupported→nearest+note in analysis.
-Style: x-labels ~45° if crowded; titles/axes/legends Vietnamese; annotate bars if ≤15.
+fig,ax=plt.subplots(figsize=(...)); fig.tight_layout() before result.
+cat-dist→bar(horiz>8); num-dist→hist/violin; 2num→scatter; cat-num→box/violin;
+part-whole→pie(≤6); time→line; corr→heatmap(annot=True,fmt=".2f").
+x-labels 45° if crowded; titles/axes/legends Vietnamese; annotate bars if ≤15.
 </chart_hints>"""
 
 
-SELF_CHECK_INSTRUCTIONS = """<self_check>
-Verify: columns exist in <metadata>; no hardcoded values; result type matches contract;
-no plt.show(); no file/network I/O.
-</self_check>"""
+def _build_slim_metadata(df, df_name: str) -> tuple[str, str]:
+    """
+    Thay thế df.info() (dài ~30 dòng) bằng bảng col|dtype|nulls compact.
+    Trả về (metadata_block, context_line).
+    """
+    n_rows, n_cols = df.shape
+    null_counts = df.isnull().sum()
+
+    # Header ngắn
+    lines = [f"shape=({n_rows},{n_cols})"]
+    lines.append("col | dtype | nulls")
+    lines.append("--- | ----- | -----")
+    for col in df.columns:
+        dtype_str = str(df[col].dtype)
+        nulls = int(null_counts[col])
+        lines.append(f"{col} | {dtype_str} | {nulls}")
+    meta_table = "\n".join(lines)
+
+    # Sample nhỏ (2 dòng)
+    sample_csv = df.head(_PROMPT_SAMPLE_ROWS).to_csv(index=False)
+
+    metadata_block = (
+        f"\n<{df_name}>\n"
+        f"[SCHEMA {df_name}]:\n{meta_table}\n"
+        f"[SAMPLE {df_name}]:\n{sample_csv}"
+        f"</{df_name}>\n"
+    )
+    context_line = f"- {df_name}: columns={list(df.columns)}"
+    return metadata_block, context_line
+
+
+def _get_cached_metadata(df, df_name: str) -> tuple[str, str]:
+    """
+    Cache metadata trong st.session_state theo id(df).
+    Khi df không đổi (cùng object), bỏ qua df.info() + df.sample() hoàn toàn.
+    """
+    cache_key = f"_prompt_meta_{id(df)}"
+    cached = st.session_state.get(cache_key)
+    if cached is not None:
+        return cached
+    result = _build_slim_metadata(df, df_name)
+    st.session_state[cache_key] = result
+    return result
 
 
 def classify_intent(llm: object, question: str, history: str) -> dict:
     """LLM routing: intent, soft graph_type hint, analysis tag."""
-    prompt = f"""Real-estate data chatbot router. Return ONE JSON only, no extra text.
-Fields:
-- intent: data_analysis | metadata_query | general_chat
-- analysis_intent (if data_analysis): physical_structure_vs_price | bigger_equals_more_expensive | ambiguous | none
-- graph_type: soft hint — best label or "none". Labels: scatter_2d_plot, bubble_plot, scatter_3d_plot,
-  bar_plot, line_plot, histogram_plot, pie_plot, box_plot, area_plot, heatmap, violin_plot,
-  density_contour_plot, polar_plot, surface_plot, candle_plot, treemap_plot, sunburst_plot,
-  choroplethmap_plot, densitymap_plot, scattermap_plot, table, none
-- target_col: column name from question or "none"
-
-History: {history}
-Question: {question}"""
+    # Prompt rút gọn: bỏ phần giải thích dài của từng graph_type label
+    prompt = f"""Real-estate chatbot router. ONE JSON only, no extra text.
+Fields: intent(data_analysis|metadata_query|general_chat),
+graph_type(scatter_2d_plot|bubble_plot|scatter_3d_plot|bar_plot|line_plot|histogram_plot|pie_plot|box_plot|area_plot|heatmap|violin_plot|density_contour_plot|polar_plot|surface_plot|candle_plot|treemap_plot|sunburst_plot|choroplethmap_plot|densitymap_plot|scattermap_plot|table|none),
+target_col(column name or "none"), analysis_intent(physical_structure_vs_price|bigger_equals_more_expensive|ambiguous|none).
+History:{history}
+Question:{question}"""
     try:
         import json
         import re
-
         response = llm.invoke(prompt).content
         match = re.search(r"\{.*\}", response, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception:
         pass
-    return {
-        "intent": "data_analysis",
-        "graph_type": "none",
-        "target_col": "none",
-        "analysis_intent": "none",
-    }
+    return {"intent": "data_analysis", "graph_type": "none", "target_col": "none", "analysis_intent": "none"}
 
 
 def define_graph_type(llm: object, question_user: str, hist_questions: str) -> str:
-    """LLM-only routing for plot/table vs non-plot branch (no keyword fast-path)."""
     res = classify_intent(llm, question_user, hist_questions)
     return res.get("graph_type", "none") or "none"
 
@@ -91,108 +130,93 @@ def process_prompt(
 ) -> str:
     """
     Build metadata, RAG routing, semantic RAG from rag_docs/, and the final code-generation prompt.
+    Tối ưu: metadata cache + slim schema + lịch sử cắt ngắn.
     """
 
-    last_df = None
+    # ── Build metadata (cached per df object) ────────────────────────────────
+    output_parts = []
+    context_parts = []
     try:
-        output_parts = []
-        context_parts = []
         for index, (name, df) in enumerate(data.items(), start=1):
-            last_df = df
-            buffer = StringIO()
-            df.info(buf=buffer)
-            df_info = buffer.getvalue()
-            df_sample = df.sample(st.session_state["sample_var"]).to_csv(
-                path_or_buf=None, index=False
-            )
-            df_context_sample = df.head(2).to_string(index=False)
             df_name = f"DF_{index}"
-            output_parts.append(
-                f"\n<{df_name}>\n[INFO {df_name}]:\n{df_info}[SAMPLES {df_name}]:\n{df_sample}</{df_name}>\n"
-            )
-            context_parts.append(
-                f"- {df_name}: columns={list(df.columns)}\n  sample:\n{df_context_sample}"
-            )
+            meta_block, ctx_line = _get_cached_metadata(df, df_name)
+            output_parts.append(meta_block)
+            context_parts.append(ctx_line)
         metadata = "\n".join(output_parts)
         data_context = "\n".join(context_parts)
     except Exception as e:
-        data = {}
         exception_name = type(e).__name__
         track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
-        message_ = "WARNING! Sample data error, provided only columns as samples"
-        st.error(f"{message_}  <{exception_name}: {track_line}>")
-        cols = list(last_df.columns) if last_df is not None else []
-        metadata = str(cols)
-        data_context = f"columns_only={metadata}"
+        st.error(f"WARNING! Metadata error <{exception_name}: {track_line}>")
+        # Fallback: chỉ gửi tên cột
+        cols = list(next(iter(data.values())).columns) if data else []
+        metadata = f"columns={cols}"
+        data_context = metadata
 
-    if st.session_state["context_code_var"]:
+    # ── Last code context ─────────────────────────────────────────────────────
+    if st.session_state.get("context_code_var"):
         st.session_state["context_code_var"] = False
-        context_code = st.session_state["last_code"]
+        context_code = st.session_state.get("last_code") or "# (none)"
     else:
-        context_code = "No code returned for context."
+        context_code = "# (none)"
 
+    # ── Lịch sử: chỉ lấy N câu hỏi gần nhất ─────────────────────────────────
     user_questions = [item for item in session_msgs if item["role"] == "user"]
-    questions_text = "\n".join([item["question"] for item in user_questions])
+    recent_questions = user_questions[-_MAX_HISTORY_TURNS:]
+    questions_text = "\n".join([item["question"] for item in recent_questions])
 
+    # ── Graph type routing ────────────────────────────────────────────────────
     graph_type = define_graph_type(llm, user_question, questions_text)
     params_plot = _matplotlib_graph_hints()
 
+    # ── RAG context ───────────────────────────────────────────────────────────
     try:
-        rag_docs_context = build_rag_context(
-            user_question, top_k=3, min_similarity=0.25
-        )
+        rag_docs_context = build_rag_context(user_question, top_k=3, min_similarity=0.25)
         if rag_docs_context:
-            print(
-                f"\n{Fore.LIGHTMAGENTA_EX}[RAGDocs] Context injected from rag_docs/{Fore.RESET}"
-            )
+            print(f"\n{Fore.LIGHTMAGENTA_EX}[RAGDocs] Context injected ({len(rag_docs_context)} chars){Fore.RESET}")
         else:
-            print(
-                f"\n{Fore.LIGHTBLACK_EX}[RAGDocs] No relevant docs found (similarity < 0.25){Fore.RESET}"
-            )
+            print(f"\n{Fore.LIGHTBLACK_EX}[RAGDocs] No relevant docs (similarity < 0.25){Fore.RESET}")
     except Exception as e:
         rag_docs_context = ""
         print(f"\n{Fore.LIGHTRED_EX}[RAGDocs] Error: {e}{Fore.RESET}")
 
-    if graph_type in [
+    # ── Result contract tuỳ graph type ───────────────────────────────────────
+    chart_types = {
         "scatter_2d_plot", "bubble_plot", "scatter_3d_plot", "bar_plot", "line_plot",
         "histogram_plot", "pie_plot", "box_plot", "area_plot", "choroplethmap_plot",
         "densitymap_plot", "scattermap_plot", "polar_plot", "surface_plot", "heatmap",
         "candle_plot", "violin_plot", "density_contour_plot", "sunburst_plot", "treemap_plot",
-    ]:
+    }
+    if graph_type in chart_types:
         result_instruction = (
-            "# result = {'figure': fig, 'analysis': analysis}  ← dict always, never bare Figure\n"
-            "# analysis: Vietnamese, ≤3 sentences, cite ≥1 number from chart."
+            "# result = {'figure': fig, 'analysis': analysis}  ← dict always\n"
+            "# analysis: Vietnamese, ≤3 sentences, cite ≥1 number."
         )
-        prompt_context = f"Chart intent. {params_plot}\nanalysis: Vietnamese, ≤3 sentences, ≥1 chart number; note correlation ≠ causation if price vs. driver."
-
+        prompt_context = f"Chart intent. {params_plot}\nanalysis Vietnamese ≤3 sentences ≥1 number."
     elif graph_type == "table":
-        result_instruction = "# result = <pd.DataFrame>  ← no plot"
-        prompt_context = "Table intent. Filter/aggregate df; assign DataFrame to result. Skip matplotlib unless table + chart explicitly requested."
-
+        result_instruction = "# result = <pd.DataFrame>"
+        prompt_context = "Table intent. Filter/aggregate df → result. No plot unless asked."
     else:
         result_instruction = (
-            "# result = '<Vietnamese answer string>'\n"
-            "# If a chart genuinely helps: result = {'figure': fig, 'analysis': '<Vietnamese>'}"
+            "# result = '<Vietnamese answer>'\n"
+            "# Chart if it adds insight: result = {'figure': fig, 'analysis': '<Vietnamese>'}"
         )
-        prompt_context = f"Text/stats intent. Return Vietnamese string in result. Plot only if it materially adds insight; if so use dict contract. {params_plot}"
+        prompt_context = f"Text/stats intent. Vietnamese string in result. {params_plot}"
 
     print(f"\n\n{Fore.LIGHTGREEN_EX}STARTING RUNTIME...{Fore.RESET}")
-    print(f"\n{Fore.LIGHTBLUE_EX}GRAPH TYPE BASE:{Fore.RESET} {graph_type}")
+    print(f"\n{Fore.LIGHTBLUE_EX}GRAPH TYPE:{Fore.RESET} {graph_type}")
 
+    # ── Final prompt ─────────────────────────────────────────────────────────
     prompt_main = f"""Python data-analysis agent — Vietnamese real-estate dataset.
-Write ONE self-contained python code block answering <main_question>. Executed in sandbox.
+Write ONE self-contained python block answering <q>. Executed in sandbox.
 
-<metadata>
+<meta>
 {metadata}
-</metadata>
-<data_context>
-{data_context}
-</data_context>
-{rag_docs_context}
-{STRICT_PROMPT_RULES}
+</meta>
+{rag_docs_context}{STRICT_PROMPT_RULES}
 {SELF_CHECK_INSTRUCTIONS}
 
-Sandbox vars: DF_1, DF_2, … (default: DF_1). Skeleton:
+Sandbox vars: DF_1, DF_2,… (default DF_1). Skeleton:
 ```python
 import pandas as pd, matplotlib.pyplot as plt, seaborn as sns
 df = DF_1
@@ -200,19 +224,19 @@ df = DF_1
 {result_instruction}
 result = None
 ```
-<main_question> overrides history/last_code. Round numbers ≤2 decimals.
-On error (<code_error>/<message_error>): rewrite root cause, don't just wrap try/except.
+<q> overrides history/last_code. Round ≤2 decimals.
+On error (<code_error>/<message_error>): rewrite root cause.
 
 <guidelines>{prompt_context}</guidelines>
-<messages_history>{questions_text}</messages_history>
-<main_question>{user_question}</main_question>
+<history>{questions_text}</history>
+<q>{user_question}</q>
 <last_code>
 ```python
 {context_code}
 ```
 </last_code>
 
-Return COMPLETE solution in ONE fenced python block. No text outside it.
+ONE fenced python block only. No text outside.
 {VIETNAMESE_USER_FACING_OUTPUT}
 """
     return prompt_main

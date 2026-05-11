@@ -22,7 +22,7 @@ build/
 # === Data & Large Files ===
 # Common patterns for local data you don't want to track
 
-*.json
+
 *.xlsx
 *.parquet
 *.sqlite3
@@ -253,3 +253,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+.chromadb/
