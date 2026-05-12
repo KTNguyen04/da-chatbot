@@ -289,7 +289,7 @@ def should_answer_normally(
     ]
     context_keywords = [
         "có ý nghĩa gì", "ý nghĩa", "nghĩa là gì", "là gì", "giải thích",
-        "câu chuyện", "phía sau", "nguồn gốc", "mô tả", "thuộc tính",
+        "câu chuyện", "phía sau", "nguồn gốc", "thuộc tính",
         "trường ", "field", "column", "describe", "what is", "what does", "explain",
     ]
     help_keywords = [
@@ -318,6 +318,8 @@ def should_answer_normally(
         "loại nào", "phân phối", "thống kê", "ranking", "ảnh hưởng", "tác động",
         "nhà to hơn", "đồ họa", "thống kê mô tả", "phân tích dữ liệu",
         "xu hướng giá", "theo tỉnh", "theo thành phố", "theo loại nhà",
+        "thống kê mô tả", "bảng thống kê", "tạo bảng", "describe",
+        "tổng quan dữ liệu", "summary", "tóm tắt dữ liệu",
     ]
     if _contains_any(q, visualization_keywords):
         return (False, "")
