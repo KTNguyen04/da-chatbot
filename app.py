@@ -456,6 +456,14 @@ if "sample_var" not in st.session_state:
 if "agent_var" not in st.session_state:
     st.session_state["agent_var"] = None
 
+# ── Approval workflow state ───────────────────────────────────────────────────
+# pending_approval: dict with keys "code", "prompt", "question"  — or None
+if "pending_approval" not in st.session_state:
+    st.session_state["pending_approval"] = None
+# approval_decision: "accepted" | "rejected" | None
+if "approval_decision" not in st.session_state:
+    st.session_state["approval_decision"] = None
+
 
 def clear_chat_history() -> None:
     messages = st.session_state.get("messages", [])
@@ -470,6 +478,8 @@ def clear_chat_history() -> None:
     st.session_state["context_code_var"] = False
     st.session_state["response_error_var"] = ""
     st.session_state["messages"] = []
+    st.session_state["pending_approval"] = None
+    st.session_state["approval_decision"] = None
     agent = st.session_state.get("agent_var")
     if agent is not None:
         agent.chat_stop()
@@ -559,6 +569,224 @@ def _warmup_rag_resources() -> None:
 
 # ── Chat processing ───────────────────────────────────────────────────────────
 
+def _render_message(message: dict) -> None:
+    """Render a single assistant/user message stored in session_state.messages."""
+    with st.chat_message(message["role"]):
+        if "question" in message:
+            st.markdown(message["question"])
+        elif "response" in message:
+            resp = message["response"]
+            if isinstance(resp, str):
+                st.write(resp)
+            elif isinstance(resp, Figure):
+                st.pyplot(resp)
+            elif isinstance(resp, dict) and "figure" in resp:
+                fig_obj = resp["figure"]
+                if isinstance(fig_obj, Figure):
+                    st.pyplot(fig_obj)
+                analysis_text = resp.get("analysis", "")
+                if analysis_text:
+                    st.markdown(analysis_text)
+            elif isinstance(resp, (list, tuple)):
+                for item in resp:
+                    if isinstance(item, Figure):
+                        st.pyplot(item)
+                    else:
+                        st.write(item)
+            elif isinstance(resp, dict):
+                for key_, value_ in resp.items():
+                    if isinstance(value_, Figure):
+                        st.pyplot(value_)
+                    else:
+                        st.write(value_)
+            else:
+                st.write(resp)
+        elif "error" in message:
+            st.text(message["error"])
+
+
+def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
+    """
+    Display the pending-approval panel.
+
+    Shows an editable code area with three action buttons:
+    - Accept  → execute the (possibly edited) code → store result → clear pending → rerun
+    - Reject  → clear pending → append rejection notice → rerun
+    - Regenerate → call chat_generate() again with the same prompt → update pending code → rerun
+    """
+    pending = st.session_state["pending_approval"]
+    if pending is None:
+        return
+
+    st.divider()
+    st.markdown("### 🔍 Duyệt code trước khi thực thi")
+    st.caption(
+        "AI đã sinh ra đoạn code bên dưới. Bạn có thể chỉnh sửa trực tiếp, "
+        "rồi chọn một trong các hành động bên dưới."
+    )
+
+    edited_code = st.text_area(
+        "Python code (có thể chỉnh sửa)",
+        value=pending["code"],
+        height=350,
+        key="approval_code_editor",
+    )
+
+    col_accept, col_regen, col_reject = st.columns([2, 2, 1])
+
+    with col_accept:
+        accept_clicked = st.button(
+            "✅ Chấp nhận & Thực thi",
+            type="primary",
+            use_container_width=True,
+            key="btn_approve",
+        )
+    with col_regen:
+        regen_clicked = st.button(
+            "🔄 Tạo lại code",
+            type="secondary",
+            use_container_width=True,
+            key="btn_regen",
+        )
+    with col_reject:
+        reject_clicked = st.button(
+            "❌ Từ chối",
+            type="secondary",
+            use_container_width=True,
+            key="btn_reject",
+        )
+
+    if reject_clicked:
+        print(f"{Fore.YELLOW}[APPROVAL] Rejected by user{Fore.RESET}")
+        st.session_state["pending_approval"] = None
+        st.session_state["approval_decision"] = "rejected"
+        rejection_msg = "⛔ Yêu cầu đã bị từ chối. Code sẽ không được thực thi."
+        st.session_state.messages.append({"role": "assistant", "response": rejection_msg})
+        st.rerun()
+
+    if regen_clicked:
+        print(f"{Fore.CYAN}[APPROVAL] Regenerating code for: {pending['question']!r}{Fore.RESET}")
+        with st.spinner("🔄 Đang tạo lại code..."):
+            try:
+                new_code = llm_agent.chat_generate(pending["prompt"])
+                print(f"{Fore.GREEN}  ✓ Regenerated ({len(new_code.splitlines())} lines){Fore.RESET}")
+            except Exception as e:
+                exception_name = type(e).__name__
+                track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
+                st.error(f"Lỗi khi tạo lại code: {exception_name} {track_line}")
+                st.rerun()
+        # Update pending with fresh code; keep same prompt & question
+        st.session_state["pending_approval"] = {
+            "code": new_code,
+            "prompt": pending["prompt"],
+            "question": pending["question"],
+        }
+        st.session_state["last_code"] = new_code
+        st.rerun()
+
+    if accept_clicked:
+        print(f"{Fore.GREEN}[APPROVAL] Accepted by user — executing approved code...{Fore.RESET}")
+        st.session_state["pending_approval"] = None
+        st.session_state["approval_decision"] = "accepted"
+        # Store the (possibly edited) code so get_last_code() reflects human edits
+        llm_agent.last_code = edited_code
+
+        effective_user_question = pending["question"]
+        with st.spinner("⚙️ Đang thực thi code đã được duyệt..."):
+            try:
+                response = llm_agent.chat_execute(edited_code)
+                print(f"{Fore.GREEN}  ✓ Execution OK — type: {type(response).__name__}{Fore.RESET}")
+            except Exception as e:
+                exception_name = type(e).__name__
+                track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
+                response = f"EXCEPTION ERROR: {exception_name}: {track_line}"
+                print(f"{Fore.RED}  ✗ Execution FAILED: {exception_name} {track_line}{Fore.RESET}")
+
+        st.session_state["last_code"] = llm_agent.get_last_code()
+        st.session_state["context_code_var"] = True
+
+        response = str(response) if isinstance(response, (int, float)) else response
+        response = str(response.item()) if isinstance(response, np.ndarray) else response
+
+        # ── Tool-Calling Insight ──────────────────────────────────────────────
+        fig_for_insight: Figure | None = None
+        agent_analysis: str | None = None
+        if ENABLE_TOOL_INSIGHT:
+            if isinstance(response, dict):
+                cand = response.get("figure")
+                if isinstance(cand, Figure):
+                    fig_for_insight = cand
+                agent_analysis = response.get("analysis")
+            elif isinstance(response, Figure):
+                fig_for_insight = response
+
+        tool_insight_text: str | None = None
+        if ENABLE_TOOL_INSIGHT and (fig_for_insight is not None or isinstance(response, str)):
+            print(f"{Fore.CYAN}[APPROVAL] Running tool insight...{Fore.RESET}")
+            main_df = _get_main_df(data)
+            _llm: LiteLLMWrapper = llm  # type: ignore[assignment]
+            _raw_model = getattr(_llm, "_model_raw", getattr(_llm, "model", "qwen2.5:7b"))
+            with st.spinner("🔧 Đang gọi tool phân tích số liệu..."):
+                tool_insight_text = run_tool_insight(
+                    user_question=effective_user_question,
+                    df=main_df,
+                    ollama_base_url=OLLAMA_BASE_URL,
+                    model=_raw_model,
+                    verbose=VERBOSE,
+                )
+
+        # ── Persist result ────────────────────────────────────────────────────
+        try:
+            if isinstance(response, str):
+                if response.split() and response.split()[0] == "EXCEPTION":
+                    st.session_state["response_error_var"] = response
+                    if tool_insight_text:
+                        response = (
+                            "Mình gặp lỗi khi dựng biểu đồ tự động, "
+                            "nhưng vẫn rút được kết luận từ tools:\n\n"
+                            f"**🔧 Phân tích:**\n\n{tool_insight_text}"
+                        )
+                    else:
+                        response = (
+                            "Xin lỗi, mình không thể đáp ứng yêu cầu của bạn. "
+                            "Bạn hãy xóa lịch sử hội thoại và thử lại nhé."
+                        )
+                    st.session_state["last_code"] = None
+                else:
+                    if tool_insight_text:
+                        response = (
+                            f"{response}\n\n---\n**🔧 Phân tích:**\n\n{tool_insight_text}"
+                        )
+                st.session_state.messages.append({"role": "assistant", "response": response})
+
+            elif isinstance(response, dict) and "figure" in response:
+                combined_insight = ""
+                if agent_analysis:
+                    combined_insight += agent_analysis
+                if tool_insight_text:
+                    sep = "\n\n---\n" if combined_insight else ""
+                    combined_insight += f"{sep}**🔧 Phân tích:**\n\n{tool_insight_text}"
+                if combined_insight:
+                    response["analysis"] = combined_insight
+                st.session_state.messages.append({"role": "assistant", "response": response})
+
+            elif isinstance(response, Figure):
+                payload: dict = {"figure": response}
+                if tool_insight_text:
+                    payload["analysis"] = "**🔧 Phân tích:**\n\n" + tool_insight_text
+                st.session_state.messages.append({"role": "assistant", "response": payload})
+
+            else:
+                st.session_state.messages.append({"role": "assistant", "response": response})
+
+        except Exception as e:
+            exception_name = type(e).__name__
+            track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
+            st.error(f"Lỗi khi lưu kết quả: <{exception_name}: {track_line}>")
+
+        st.rerun()
+
+
 def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
     with st.chat_message("assistant"):
         st.write("Chào bạn! Mình sẵn sàng giúp bạn khám phá dữ liệu. Bắt đầu thôi?")
@@ -566,39 +794,11 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    # ── Render conversation history ───────────────────────────────────────────
     for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if "question" in message:
-                st.markdown(message["question"])
-            elif "response" in message:
-                if isinstance(message["response"], str):
-                    st.write(message["response"])
-                elif isinstance(message["response"], Figure):
-                    st.pyplot(message["response"])
-                elif isinstance(message["response"], dict) and "figure" in message["response"]:
-                    fig_obj = message["response"]["figure"]
-                    if isinstance(fig_obj, Figure):
-                        st.pyplot(fig_obj)
-                    analysis_text = message["response"].get("analysis", "")
-                    if analysis_text:
-                        st.markdown(analysis_text)
-                elif isinstance(message["response"], (list, tuple)):
-                    for item in message["response"]:
-                        if isinstance(item, Figure):
-                            st.pyplot(item)
-                        else:
-                            st.write(item)
-                elif isinstance(message["response"], dict):
-                    for key_, value_ in message["response"].items():
-                        if isinstance(value_, Figure):
-                            st.pyplot(value_)
-                        else:
-                            st.write(value_)
-                else:
-                    st.write(message["response"])
-            elif "error" in message:
-                st.text(message["error"])
+        _render_message(message)
 
+    # ── Code / error expander ─────────────────────────────────────────────────
     _, col1, _ = st.columns([1, 8, 1])
     if st.session_state["last_code"]:
         with col1:
@@ -609,6 +809,14 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
             with st.expander("Lỗi phản hồi"):
                 st.error(st.session_state["response_error_var"])
 
+    # ── Approval panel (shown when code is pending) ───────────────────────────
+    if st.session_state["pending_approval"] is not None:
+        _render_approval_panel(llm_agent, llm, data)
+        # Block chat input while waiting for approval
+        st.info("⏳ Đang chờ bạn xét duyệt code ở trên trước khi tiếp tục.")
+        return
+
+    # ── Chat input ────────────────────────────────────────────────────────────
     if user_question := st.chat_input("Nhập câu hỏi để mình phân tích dữ liệu cho bạn..."):
         st.session_state["response_error_var"] = ""
         user_question = user_question.strip()
@@ -694,179 +902,44 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
                 print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
                 st.rerun()
 
-            print(f"\n{Fore.CYAN}[STEP 2] BUILD PROMPT & AGENT CHAT{Fore.RESET}")
+            # ── STEP 2: Build prompt ──────────────────────────────────────────
+            print(f"\n{Fore.CYAN}[STEP 2] BUILD PROMPT{Fore.RESET}")
             with st.spinner("Đang phân tích..."):
                 try:
                     prompt = process_prompt(
                         st.session_state.messages, effective_user_question, data, llm
                     )
                     print(f"{Fore.WHITE}  Prompt built ({len(prompt)} chars){Fore.RESET}")
-                    print(f"{Fore.CYAN}[STEP 3] LLM INVOKE + CODE EXECUTION{Fore.RESET}")
-                    response = llm_agent.chat(prompt)
-                    print(f"{Fore.GREEN}  ✓ Agent response type: {type(response).__name__}{Fore.RESET}")
                 except Exception as e:
                     exception_name = type(e).__name__
                     track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
-                    response = f"EXCEPTION ERROR: {exception_name}: {track_line}"
-                    print(f"{Fore.RED}  ✗ Agent FAILED: {exception_name} {track_line}{Fore.RESET}")
+                    st.error(f"Lỗi xây dựng prompt: {exception_name} {track_line}")
+                    st.rerun()
 
-                st.session_state["last_code"] = llm_agent.get_last_code()
-                st.session_state["context_code_var"] = True
-
-                response = (
-                    str(response)
-                    if isinstance(response, (int, float))
-                    else response
-                )
-                response = (
-                    str(response.item())
-                    if isinstance(response, np.ndarray)
-                    else response
-                )
-
-                print(f"\n{Fore.CYAN}[STEP 4] XỬ LÝ KẾT QUẢ AGENT{Fore.RESET}")
-                print(f"{Fore.LIGHTYELLOW_EX}CODE RESPONSE:{Fore.RESET}", type(response))
-                if isinstance(response, dict):
-                    print(f"{Fore.WHITE}  response keys: {list(response.keys())}{Fore.RESET}")
-                elif isinstance(response, str):
-                    preview = response[:80].replace("\n", " ")
-                    print(f"{Fore.WHITE}  response preview: {preview!r}{Fore.RESET}")
-
-                # ── Tool-Calling Insight ──────────────────────────────────────
-                fig_for_insight: Figure | None = None
-                agent_analysis: str | None = None
-
-                if ENABLE_TOOL_INSIGHT:
-                    if isinstance(response, dict):
-                        cand = response.get("figure")
-                        if isinstance(cand, Figure):
-                            fig_for_insight = cand
-                        agent_analysis = response.get("analysis")
-                    elif isinstance(response, Figure):
-                        fig_for_insight = response
-
-                tool_insight_text: str | None = None
-                if ENABLE_TOOL_INSIGHT and (
-                    fig_for_insight is not None or isinstance(response, str)
-                ):
-                    print(f"\n{Fore.CYAN}[STEP 5] TOOL-CALLING INSIGHT{Fore.RESET}")
-                    main_df = _get_main_df(data)
-                    # Lấy model name thực (bỏ prefix ollama/)
-                    _llm: LiteLLMWrapper = llm  # type: ignore[assignment]
-                    _raw_model = getattr(_llm, "_model_raw", getattr(_llm, "model", "qwen2.5:7b"))
-                    with st.spinner("🔧 Đang gọi tool phân tích số liệu..."):
-                        tool_insight_text = run_tool_insight(
-                            user_question=effective_user_question,
-                            df=main_df,
-                            ollama_base_url=OLLAMA_BASE_URL,
-                            model=_raw_model,
-                            verbose=VERBOSE,
-                        )
-                    if tool_insight_text:
-                        preview = tool_insight_text[:100].replace("\n", " ")
-                        print(f"{Fore.GREEN}  ✓ Tool insight OK ({len(tool_insight_text)} chars): {preview!r}{Fore.RESET}")
-                    else:
-                        print(f"{Fore.YELLOW}  ⚠ Tool insight trống{Fore.RESET}")
-                else:
-                    print(f"\n{Fore.CYAN}[STEP 5] TOOL-CALLING INSIGHT — bỏ qua{Fore.RESET}")
-
-                # ── BƯỚC 6: Lưu session ───────────────────────────────────────
-                print(f"\n{Fore.CYAN}[STEP 6] LƯU SESSION & RERUN{Fore.RESET}")
-                try:
-                    if isinstance(response, str):
-                        if response.split()[0] == "EXCEPTION":
-                            print(f"{Fore.RED}  ✗ EXCEPTION trong response{Fore.RESET}")
-                            st.session_state["response_error_var"] = response
-                            if tool_insight_text:
-                                response = (
-                                    "Mình gặp lỗi khi dựng biểu đồ tự động, "
-                                    "nhưng vẫn rút được kết luận từ tools:\n\n"
-                                    f"**🔧 Phân tích:**\n\n{tool_insight_text}"
-                                )
-                            else:
-                                response = (
-                                    "Xin lỗi, mình không thể đáp ứng yêu cầu của bạn. "
-                                    "Bạn hãy xóa lịch sử hội thoại và thử lại nhé."
-                                )
-                            st.session_state["last_code"] = None
-                            _stream_text(response)
-                        else:
-                            if tool_insight_text:
-                                _stream_text(response)
-                                st.markdown("\n\n---")
-                                st.markdown("**🔧 Phân tích:**\n")
-                                _stream_text(tool_insight_text)
-                                response = (
-                                    f"{response}\n\n---\n"
-                                    f"**🔧 Phân tích:**\n\n"
-                                    f"{tool_insight_text}"
-                                )
-                            else:
-                                _stream_text(response)
-                            print(f"{Fore.GREEN}  ✓ Lưu response dạng str{Fore.RESET}")
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": response}
-                        )
-
-                    elif isinstance(response, dict) and "figure" in response:
-                        combined_insight = ""
-                        if agent_analysis:
-                            combined_insight += agent_analysis
-                        if tool_insight_text:
-                            separator = "\n\n---\n" if combined_insight else ""
-                            combined_insight += (
-                                f"{separator}**🔧 Phân tích:**\n\n{tool_insight_text}"
-                            )
-                        if combined_insight:
-                            response["analysis"] = combined_insight
-                        fig_out = response["figure"]
-                        if isinstance(fig_out, Figure):
-                            st.pyplot(fig_out)
-                        if combined_insight:
-                            _stream_text(combined_insight)
-                        print(
-                            f"{Fore.GREEN}  ✓ Lưu response dạng dict+figure | "
-                            f"has_analysis={bool(combined_insight)}{Fore.RESET}"
-                        )
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": response}
-                        )
-
-                    elif isinstance(response, Figure):
-                        payload = {"figure": response}
-                        if tool_insight_text:
-                            payload["analysis"] = (
-                                "**🔧 Phân tích:**\n\n" + tool_insight_text
-                            )
-                        st.pyplot(response)
-                        if tool_insight_text:
-                            st.markdown("**🔧 Phân tích:**\n")
-                            _stream_text(tool_insight_text)
-                        print(
-                            f"{Fore.GREEN}  ✓ Lưu response dạng figure | "
-                            f"has_analysis={bool(tool_insight_text)}{Fore.RESET}"
-                        )
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": payload}
-                        )
-                    else:
-                        print(
-                            f"{Fore.GREEN}  ✓ Lưu response dạng "
-                            f"{type(response).__name__}{Fore.RESET}"
-                        )
-                        st.session_state.messages.append(
-                            {"role": "assistant", "response": response}
-                        )
-
-                except Exception as e:
-                    exception_name = type(e).__name__
-                    track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
-                    message_ = "Lỗi khi hiển thị kết quả:"
-                    print(f"{Fore.RED}  ✗ Lỗi lưu session: {exception_name} {track_line}{Fore.RESET}")
-                    st.error(f"{message_}  <{exception_name}: {track_line}>")
-
-                print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
+            # ── STEP 3: LLM → code (NO execution yet) ────────────────────────
+            print(f"\n{Fore.CYAN}[STEP 3] LLM GENERATE CODE (pending approval){Fore.RESET}")
+            try:
+                generated_code = llm_agent.chat_generate(prompt)
+                print(f"{Fore.GREEN}  ✓ Code generated ({len(generated_code.splitlines())} lines){Fore.RESET}")
+            except Exception as e:
+                exception_name = type(e).__name__
+                track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
+                error_msg = f"Mình gặp lỗi khi sinh code: {exception_name} {track_line}"
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "response": error_msg})
                 st.rerun()
+
+            # ── STEP 4: Store pending approval — do NOT execute ───────────────
+            print(f"\n{Fore.CYAN}[STEP 4] STORE PENDING APPROVAL{Fore.RESET}")
+            st.session_state["pending_approval"] = {
+                "code": generated_code,
+                "prompt": prompt,
+                "question": effective_user_question,
+            }
+            st.session_state["last_code"] = generated_code
+            st.session_state["context_code_var"] = True
+            print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
+            st.rerun()
 
 
 # ── Sidebar: model selector + Ollama status ───────────────────────────────────

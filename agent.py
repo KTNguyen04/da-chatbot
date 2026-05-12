@@ -245,6 +245,133 @@ class AgentAI:
                 print(f"{Fore.YELLOW}[AGENT] Retry in {backoff:.1f}s...{Fore.RESET}")
                 sleep(backoff)
 
+    # ── Approval-workflow methods ─────────────────────────────────────────────
+
+    def chat_generate(self, prompt: str) -> str:
+        """
+        Phase 1 of the approval workflow: call the LLM and extract the code block.
+        Does NOT execute anything.  Returns the extracted code string (or a
+        placeholder that will raise on exec so the caller knows generation failed).
+
+        Args:
+            prompt (str): the full prompt to send to the LLM.
+
+        Returns:
+            str: the extracted Python code (not yet executed).
+        """
+        self.last_prompt = prompt
+
+        if self.verbose:
+            print(f"\n{Fore.LIGHTYELLOW_EX}[AGENT] GENERATE — FINAL PROMPT:{Fore.RESET}{prompt}\n")
+
+        print(f"\n{Fore.LIGHTBLUE_EX}[AGENT] chat_generate — streaming LLM...{Fore.RESET}")
+
+        if ENABLE_LLM_STREAMING:
+            content = self._invoke_llm_with_stream(prompt)
+        else:
+            content = self._invoke_llm_blocking(prompt)
+
+        print(f"{Fore.WHITE}[AGENT] LLM response (content len={len(content)}){Fore.RESET}")
+
+        if content:
+            match = re.search(r"```python(.*?)```", content, re.DOTALL)
+            if match:
+                code = match.group(1)
+                lines = len(code.strip().splitlines())
+                print(f"{Fore.WHITE}[AGENT] Code extracted ({lines} lines){Fore.RESET}")
+            else:
+                print(f"{Fore.YELLOW}[AGENT] No code block found in response{Fore.RESET}")
+                code = '# ⚠ Không tìm thấy code block trong phản hồi của LLM\nresult = None'
+        else:
+            print(f"{Fore.YELLOW}[AGENT] Empty LLM response{Fore.RESET}")
+            code = '# ⚠ LLM trả về phản hồi rỗng\nresult = None'
+
+        self.last_code = code
+        return code
+
+    def chat_execute(self, code: str) -> Union[list, str, pd.DataFrame, Figure, dict]:
+        """
+        Phase 2 of the approval workflow: execute *exactly* the code supplied by
+        the human (after optional edits).  Retries with the LLM on exception,
+        just like the original chat() loop.
+
+        Args:
+            code (str): the (possibly human-edited) Python code to execute.
+
+        Returns:
+            Union[list, str, pd.DataFrame, Figure, dict]: code execution result.
+        """
+        prompt_ = self.last_prompt or ""
+        attempts_var = 0
+
+        # First attempt uses the human-approved code directly
+        approved_code = code
+
+        while attempts_var <= self.max_attempts:
+            if self.break_run:
+                self.break_run = False
+                print(f"\n{Fore.LIGHTRED_EX}STOPPED INSTANCE!!!{Fore.RESET}\n")
+                break
+
+            attempts_var += 1
+            current_code = approved_code if attempts_var == 1 else self.last_code
+
+            print(
+                f"\n{Fore.LIGHTBLUE_EX}[AGENT] chat_execute attempt {attempts_var}/{self.max_attempts}{Fore.RESET}"
+            )
+
+            try:
+                self.last_code = current_code
+                print(f"{Fore.WHITE}[AGENT] Executing in sandbox...{Fore.RESET}")
+                code_result = self.exec_code(current_code)
+                print(
+                    f"{Fore.LIGHTGREEN_EX}[AGENT] ✓ Execution OK — result type: {type(code_result).__name__}{Fore.RESET}"
+                )
+                return code_result
+
+            except Exception as e:
+                if attempts_var > self.max_attempts / 2:
+                    self.llm.temperature = 0.5
+
+                error_message = str(e)
+                exception_type = f"EXCEPTION_TYPE: {type(e).__name__}\n"
+                exception_track = f"EXCEPTION_TRACK: {traceback.format_list(traceback.extract_tb(e.__traceback__)[-1:])[0].strip()}\n"
+                exception_message = f"EXCEPTION_MESSAGE: {str(e)}"
+                exception_msg = f"{exception_type}{exception_track}{exception_message}"
+
+                print(
+                    f"{Fore.LIGHTRED_EX}[AGENT] ✗ Execute error attempt {attempts_var}: "
+                    f"{type(e).__name__}: {str(e)[:120]}{Fore.RESET}"
+                )
+
+                if len(error_message.split()) > 1 and error_message.split()[1] == "SAFETY:":
+                    return error_message
+
+                if attempts_var == self.max_attempts:
+                    self.llm.temperature = 0.0
+                    print(f"{Fore.LIGHTRED_EX}[AGENT] Max attempts reached{Fore.RESET}")
+                    return f"EXCEPTION ERROR: {error_message}"
+
+                # Ask the LLM to fix the broken code
+                lines = current_code.split("\n")
+                formatted_lines = [f"|Line-{i+1:03}| {line}" for i, line in enumerate(lines)]
+                code_withlines = "\n".join(formatted_lines)
+                tag_last_code = f"\n<code_error>\n```python\n{code_withlines}```\n</code_error>\n"
+                tag_error = f"\n<message_error>\n{exception_msg}\n</message_error>\n"
+
+                fix_prompt = prompt_ + tag_last_code + tag_error
+                fix_content = self._invoke_llm_blocking(fix_prompt)
+                match = re.search(r"```python(.*?)```", fix_content, re.DOTALL)
+                if match:
+                    self.last_code = match.group(1)
+                else:
+                    self.last_code = current_code  # no new code — will fail again → exhaust attempts
+
+                import random
+                backoff = min(0.5 * (1.5 ** (attempts_var - 1)) + random.uniform(0, 0.2), 5.0)
+                print(f"{Fore.YELLOW}[AGENT] Retry in {backoff:.1f}s...{Fore.RESET}")
+                sleep(backoff)
+
     def chat_stop(self):
         """Stop atual chat runtime by set the attribute break_run to True."""
         self.break_run = True
