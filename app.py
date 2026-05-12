@@ -463,6 +463,10 @@ if "pending_approval" not in st.session_state:
 # approval_decision: "accepted" | "rejected" | None
 if "approval_decision" not in st.session_state:
     st.session_state["approval_decision"] = None
+# ace_editor_version: bumped each time code is updated via edit-instruction,
+# used as part of the st_ace key so the editor remounts with fresh content.
+if "ace_editor_version" not in st.session_state:
+    st.session_state["ace_editor_version"] = 0
 
 
 def clear_chat_history() -> None:
@@ -605,6 +609,20 @@ def _render_message(message: dict) -> None:
             st.text(message["error"])
 
 
+def _build_edit_prompt(original_code: str, user_instruction: str) -> str:
+    """
+    Build a focused prompt that asks the LLM to apply the human's edit instruction
+    to the existing code block, returning only the revised code.
+    """
+    return (
+        "You are a Python code editor. The user wants to modify the code below.\n"
+        "Apply ONLY the requested change. Keep everything else identical.\n"
+        "Return ONE fenced python block and nothing else.\n\n"
+        f"<current_code>\n```python\n{original_code}\n```\n</current_code>\n\n"
+        f"<edit_instruction>{user_instruction}</edit_instruction>"
+    )
+
+
 def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
     """
     Display the pending-approval panel.
@@ -612,7 +630,8 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
     Shows an editable code area with three action buttons:
     - Accept  → execute the (possibly edited) code → store result → clear pending → rerun
     - Reject  → clear pending → append rejection notice → rerun
-    - Regenerate → call chat_generate() again with the same prompt → update pending code → rerun
+    - Tạo lại code → dedicated chat input where the human types an edit instruction;
+                     LLM applies it surgically to the current code → update pending → rerun
     """
     pending = st.session_state["pending_approval"]
     if pending is None:
@@ -621,32 +640,56 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
     st.divider()
     st.markdown("### 🔍 Duyệt code trước khi thực thi")
     st.caption(
-        "AI đã sinh ra đoạn code bên dưới. Bạn có thể chỉnh sửa trực tiếp, "
-        "rồi chọn một trong các hành động bên dưới."
+        "AI đã sinh ra đoạn code bên dưới. Bạn có thể chỉnh sửa trực tiếp trong ô code, "
+        "hoặc dùng ô **'Yêu cầu chỉnh sửa'** để ra lệnh cho AI sửa theo ý muốn."
     )
 
-    edited_code = st.text_area(
-        "Python code (có thể chỉnh sửa)",
-        value=pending["code"],
-        height=350,
-        key="approval_code_editor",
-    )
+    # ── Editable code editor with Python syntax highlighting ──────────────────
+    # Key includes a version counter that is bumped each time the code is
+    # updated via an edit-instruction, forcing st_ace to remount with the
+    # new value instead of keeping the stale widget state.
+    ace_version = st.session_state.get("ace_editor_version", 0)
+    ace_key = f"approval_code_editor_v{ace_version}"
+    try:
+        from streamlit_ace import st_ace
+        edited_code = st_ace(
+            value=pending["code"],
+            language="python",
+            theme="monokai",
+            font_size=13,
+            tab_size=4,
+            show_gutter=True,
+            show_print_margin=False,
+            wrap=False,
+            auto_update=True,
+            height=350,
+            key=ace_key,
+        )
+        # st_ace returns None briefly on first render before user interacts;
+        # fall back to pending code to avoid wiping state.
+        if edited_code is None:
+            edited_code = pending["code"]
+    except ImportError:
+        # Graceful fallback: plain text area if streamlit-ace not installed
+        st.warning(
+            "💡 Cài `streamlit-ace` để có syntax highlighting: "
+            "`pip install streamlit-ace`"
+        )
+        edited_code = st.text_area(
+            "Python code (có thể chỉnh sửa trực tiếp)",
+            value=pending["code"],
+            height=350,
+            key=ace_key,
+        )
 
-    col_accept, col_regen, col_reject = st.columns([2, 2, 1])
-
+    # ── Action buttons ────────────────────────────────────────────────────────
+    col_accept, col_reject = st.columns([3, 1])
     with col_accept:
         accept_clicked = st.button(
             "✅ Chấp nhận & Thực thi",
             type="primary",
             use_container_width=True,
             key="btn_approve",
-        )
-    with col_regen:
-        regen_clicked = st.button(
-            "🔄 Tạo lại code",
-            type="secondary",
-            use_container_width=True,
-            key="btn_regen",
         )
     with col_reject:
         reject_clicked = st.button(
@@ -656,32 +699,72 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
             key="btn_reject",
         )
 
+    # ── Dedicated edit-instruction chat input ─────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        "##### 🔄 Tạo lại code theo yêu cầu",
+    )
+    st.caption(
+        "Nhap huong dan chinh sua — AI se ap dung dung thay doi do vao code hien tai.  \n"
+        'Vi du: "doi nguong outlier tu 3 xuong 2 standard deviations", '
+        '"dung mau xanh la cho cot gia", "them duong trung binh vao bieu do"'
+    )
+
+    edit_col, send_col = st.columns([5, 1])
+    with edit_col:
+        edit_instruction = st.text_input(
+            label="Yêu cầu chỉnh sửa code",
+            placeholder="Ví dụ: đổi outlier threshold từ 3 xuống 2 standard deviations...",
+            label_visibility="collapsed",
+            key="edit_instruction_input",
+        )
+    with send_col:
+        send_edit = st.button(
+            "Gửi ↵",
+            type="secondary",
+            use_container_width=True,
+            key="btn_send_edit",
+        )
+
+    # ── Handlers ──────────────────────────────────────────────────────────────
+
     if reject_clicked:
         print(f"{Fore.YELLOW}[APPROVAL] Rejected by user{Fore.RESET}")
         st.session_state["pending_approval"] = None
         st.session_state["approval_decision"] = "rejected"
-        rejection_msg = "⛔ Yêu cầu đã bị từ chối. Code sẽ không được thực thi."
-        st.session_state.messages.append({"role": "assistant", "response": rejection_msg})
+        st.session_state.messages.append(
+            {"role": "assistant", "response": "⛔ Yêu cầu đã bị từ chối. Code sẽ không được thực thi."}
+        )
         st.rerun()
 
-    if regen_clicked:
-        print(f"{Fore.CYAN}[APPROVAL] Regenerating code for: {pending['question']!r}{Fore.RESET}")
-        with st.spinner("🔄 Đang tạo lại code..."):
+    if send_edit and edit_instruction.strip():
+        instruction = edit_instruction.strip()
+        # Use the current text-area content (may already have manual edits) as base
+        base_code = edited_code
+        print(f"{Fore.CYAN}[APPROVAL] Edit instruction: {instruction!r}{Fore.RESET}")
+        with st.spinner("✏️ Đang áp dụng chỉnh sửa..."):
             try:
-                new_code = llm_agent.chat_generate(pending["prompt"])
-                print(f"{Fore.GREEN}  ✓ Regenerated ({len(new_code.splitlines())} lines){Fore.RESET}")
+                edit_prompt = _build_edit_prompt(base_code, instruction)
+                raw = llm_agent._invoke_llm_blocking(edit_prompt)
+                import re as _re
+                match = _re.search(r"```python(.*?)```", raw, _re.DOTALL)
+                new_code = match.group(1) if match else base_code
+                print(f"{Fore.GREEN}  ✓ Edit applied ({len(new_code.splitlines())} lines){Fore.RESET}")
             except Exception as e:
                 exception_name = type(e).__name__
                 track_line = f" L-{traceback.extract_tb(e.__traceback__)[0].lineno}"
-                st.error(f"Lỗi khi tạo lại code: {exception_name} {track_line}")
+                st.error(f"Lỗi khi áp dụng chỉnh sửa: {exception_name} {track_line}")
                 st.rerun()
-        # Update pending with fresh code; keep same prompt & question
         st.session_state["pending_approval"] = {
             "code": new_code,
             "prompt": pending["prompt"],
             "question": pending["question"],
         }
         st.session_state["last_code"] = new_code
+        # Bump the editor version so st_ace remounts with the updated code
+        st.session_state["ace_editor_version"] = (
+            st.session_state.get("ace_editor_version", 0) + 1
+        )
         st.rerun()
 
     if accept_clicked:
@@ -938,6 +1021,7 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
             }
             st.session_state["last_code"] = generated_code
             st.session_state["context_code_var"] = True
+            st.session_state["ace_editor_version"] = 0  # reset for the new approval cycle
             print(f"{Fore.CYAN}{'='*60}{Fore.RESET}\n")
             st.rerun()
 

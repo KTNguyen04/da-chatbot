@@ -27,6 +27,7 @@ dependencies = [
     { name = "sentence-transformers" },
     { name = "statsmodels" },
     { name = "streamlit" },
+    { name = "streamlit-ace" },
 ]
 
 [package.dev-dependencies]
@@ -49,6 +50,7 @@ requires-dist = [
     { name = "sentence-transformers", specifier = ">=5.4.1" },
     { name = "statsmodels", specifier = "==0.14.2" },
     { name = "streamlit", specifier = "==1.34.0" },
+    { name = "streamlit-ace", specifier = ">=0.1.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -3520,6 +3522,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0c/66/64fb04e23cc45369652d26a2b4464aea404113f192b37cf8c6d8326d58b9/streamlit-1.34.0.tar.gz", hash = "sha256:135a3b79a686b3132b73f204450ad6e889de04f3349d692925e09f0e21e74b52", size = 8142532, upload-time = "2024-05-02T17:44:16.393Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/88/34/0751fd391fe90c8a90e70ef267080e0d461a2bf00c9e84c5a39d3389470d/streamlit-1.34.0-py2.py3-none-any.whl", hash = "sha256:411183cf7f525e468eb256b343c914782d11cd894b5e30a4ab3bb1d54e3ae339", size = 8505715, upload-time = "2024-05-02T17:44:12.428Z" },
+]
+
+[[package]]
+name = "streamlit-ace"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "streamlit" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2e/34/a508123af170e41852d247b17d38d9cddc2b4be3884f2f29a84aeb322992/streamlit_ace-0.1.1.tar.gz", hash = "sha256:1852fa19707685fd4241be9256c1ab1a89da4a3b8c28ab286e3bff122d3a1686", size = 2389652, upload-time = "2021-12-07T19:01:15.66Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/c9/e862cefc5735e11c101b2bc45f37a2b767666ffe673d262004202b506f3b/streamlit_ace-0.1.1-py3-none-any.whl", hash = "sha256:cdf908a90058fa831fb720d29e2aef35a0f5799eac33e2b2e58ba9f3631b1aa5", size = 3642928, upload-time = "2021-12-07T19:01:11.288Z" },
 ]
 
 [[package]]

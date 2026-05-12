@@ -25,7 +25,8 @@ from rag_docs_manager import build_rag_context
 VIETNAMESE_USER_FACING_OUTPUT = (
     "CRITICAL: The `analysis` string MUST be written in Vietnamese only. No English in `analysis`. "
     "All user-visible text (chart titles, axis labels, legends, `result` strings) → Vietnamese. "
-    "Variable names and code comments → English."
+    "Variable names → English."
+    "Code comments → Vietnamese."
 )
 
 # ── Rút gọn rules: bỏ các chú thích dài, giữ lại điều cốt lõi ──────────────
