@@ -645,9 +645,6 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
     )
 
     # ── Editable code editor with Python syntax highlighting ──────────────────
-    # Key includes a version counter that is bumped each time the code is
-    # updated via an edit-instruction, forcing st_ace to remount with the
-    # new value instead of keeping the stale widget state.
     ace_version = st.session_state.get("ace_editor_version", 0)
     ace_key = f"approval_code_editor_v{ace_version}"
     try:
@@ -665,12 +662,9 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
             height=350,
             key=ace_key,
         )
-        # st_ace returns None briefly on first render before user interacts;
-        # fall back to pending code to avoid wiping state.
         if edited_code is None:
             edited_code = pending["code"]
     except ImportError:
-        # Graceful fallback: plain text area if streamlit-ace not installed
         st.warning(
             "💡 Cài `streamlit-ace` để có syntax highlighting: "
             "`pip install streamlit-ace`"
@@ -739,7 +733,6 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
 
     if send_edit and edit_instruction.strip():
         instruction = edit_instruction.strip()
-        # Use the current text-area content (may already have manual edits) as base
         base_code = edited_code
         print(f"{Fore.CYAN}[APPROVAL] Edit instruction: {instruction!r}{Fore.RESET}")
         with st.spinner("✏️ Đang áp dụng chỉnh sửa..."):
@@ -761,7 +754,6 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
             "question": pending["question"],
         }
         st.session_state["last_code"] = new_code
-        # Bump the editor version so st_ace remounts with the updated code
         st.session_state["ace_editor_version"] = (
             st.session_state.get("ace_editor_version", 0) + 1
         )
@@ -771,7 +763,6 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
         print(f"{Fore.GREEN}[APPROVAL] Accepted by user — executing approved code...{Fore.RESET}")
         st.session_state["pending_approval"] = None
         st.session_state["approval_decision"] = "accepted"
-        # Store the (possibly edited) code so get_last_code() reflects human edits
         llm_agent.last_code = edited_code
 
         effective_user_question = pending["question"]
@@ -808,13 +799,18 @@ def _render_approval_panel(llm_agent: AgentAI, llm: object, data: dict) -> None:
             print(f"{Fore.CYAN}[APPROVAL] Running tool insight...{Fore.RESET}")
             main_df = _get_main_df(data)
             _llm: LiteLLMWrapper = llm  # type: ignore[assignment]
-            _raw_model = getattr(_llm, "_model_raw", getattr(_llm, "model", "qwen2.5:7b"))
+
+            # ── PATCHED: dùng litellm_model + api_base thay vì ollama_base_url + model ──
+            _litellm_model: str = getattr(_llm, "model", "ollama/qwen2.5:7b")
+            _api_base: str | None = getattr(_llm, "api_base", None)
+
             with st.spinner("🔧 Đang gọi tool phân tích số liệu..."):
                 tool_insight_text = run_tool_insight(
                     user_question=effective_user_question,
                     df=main_df,
-                    ollama_base_url=OLLAMA_BASE_URL,
-                    model=_raw_model,
+                    litellm_model=_litellm_model,
+                    api_base=_api_base,
+                    temperature=getattr(_llm, "temperature", 0.1),
                     verbose=VERBOSE,
                 )
 
@@ -895,7 +891,6 @@ def process_chat(llm_agent: AgentAI, llm: object, data: dict) -> None:
     # ── Approval panel (shown when code is pending) ───────────────────────────
     if st.session_state["pending_approval"] is not None:
         _render_approval_panel(llm_agent, llm, data)
-        # Block chat input while waiting for approval
         st.info("⏳ Đang chờ bạn xét duyệt code ở trên trước khi tiếp tục.")
         return
 

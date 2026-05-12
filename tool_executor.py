@@ -5,7 +5,7 @@ Tool-Calling Engine cho AI-Datanalysis.
 Luồng hoạt động:
   1. Nhận câu hỏi + DataFrame hiện tại
   2. Build system prompt mô tả vai trò + tool schemas từ registry
-  3. Gọi Ollama /api/chat với danh sách tools (function-calling format)
+  3. Gọi LLM qua LiteLLM (hỗ trợ Ollama, Gemini, OpenAI) với danh sách tools
   4. Parse response → nếu LLM muốn gọi tool, thực thi hàm Python tương ứng
   5. Gửi lại kết quả tool cho LLM để tổng hợp insight cuối cùng
   6. Trả về chuỗi insight tiếng Việt
@@ -16,27 +16,27 @@ Luồng hoạt động:
 """
 
 import json
-import requests
 import traceback
 import pandas as pd
 from colorama import Fore
 from typing import Any, Optional, List
 
+import litellm
+
 import tools  # auto-load tất cả tool modules qua registry
 from tools import get_tool_definitions, get_tool_function, inject_dataframe_into_all_tool_modules
 
+# ── Timeout / vòng lặp ────────────────────────────────────────────────────────
 TOOL_TIMEOUT_FIRST = 90   # giây cho round đầu (cold start + model load)
 TOOL_TIMEOUT_RETRY = 60   # giây cho các round tiếp theo (model đã warm)
-TOOL_TIMEOUT = 90         # fallback / legacy alias
-MAX_TOOL_ROUNDS = 3       # giảm từ 5 → 3: tránh tích lũy timeout, đủ cho EDA thông thường
+MAX_TOOL_ROUNDS = 3       # tránh tích lũy timeout, đủ cho EDA thông thường
 
+# ── Giới hạn payload trả về cho LLM ──────────────────────────────────────────
 MAX_TOOL_MESSAGE_JSON_CHARS = 22_000
 MAX_TOOL_LIST_ITEMS = 40
 MAX_TOOL_STRING_CHARS = 4_000
 
 # ── Tool routing: keyword → tool names ────────────────────────────────────────
-# Mỗi "nhóm" gồm các tools đủ để trả lời một loại câu hỏi.
-# Câu hỏi khớp nhiều nhóm → union. Không khớp nhóm nào → fallback 5 tools cốt lõi.
 _TOOL_ROUTE_TABLE: list[tuple[list[str], list[str]]] = [
     (["tỉnh", "thành phố", "province", "city", "khu vực", "vùng", "phân bố tỉnh"],
      ["get_province_ranking", "compare_mean_by_group"]),
@@ -83,9 +83,10 @@ _FALLBACK_TOOLS = [
     "analyze_price_drivers",
 ]
 
-_MAX_TOOLS_PER_REQUEST = 5  # không gửi quá 5 tools / request
+_MAX_TOOLS_PER_REQUEST = 5
 
 
+# ── Tool routing ──────────────────────────────────────────────────────────────
 def _route_tools(question: str) -> list[dict]:
     """
     Chọn subset tool definitions phù hợp với câu hỏi dựa trên keyword matching.
@@ -109,7 +110,6 @@ def _route_tools(question: str) -> list[dict]:
     name_to_def = {d["function"]["name"]: d for d in all_defs if "function" in d}
     selected = [name_to_def[n] for n in matched if n in name_to_def]
 
-    # Nếu routing không match tool nào tồn tại → fallback toàn bộ capped
     if not selected:
         selected = all_defs[:_MAX_TOOLS_PER_REQUEST]
 
@@ -118,93 +118,14 @@ def _route_tools(question: str) -> list[dict]:
 
 # ── Inject DataFrame vào tất cả tool modules ──────────────────────────────────
 def _inject_dataframe(df: pd.DataFrame) -> None:
-    """
-    Set DataFrame cho mọi module tools đã đăng ký hàm set_dataframe (registry).
-    """
     inject_dataframe_into_all_tool_modules(df)
 
 
-def _dataset_brief(df: pd.DataFrame) -> str:
-    lines = [
-        f"Shape: {len(df):,} rows × {len(df.columns)} columns.",
-        "Columns (name: dtype):",
-    ]
-    dtype_map = df.dtypes.astype(str).to_dict()
-    for i, col in enumerate(df.columns):
-        if i >= 48:
-            lines.append(f"  … +{len(df.columns) - 48} more")
-            break
-        lines.append(f"  - {col}: {dtype_map[col]}")
-    low = {str(c).lower() for c in df.columns}
-    hints: list[str] = []
-    if "province" in low:
-        hints.append("Province column → `get_province_ranking` / `compare_mean_by_group` when relevant.")
-    if "price" in low or "price_per_m2" in low:
-        hints.append("Price-like columns → domain tools `analyze_price_drivers`, `compare_mean_by_group`, etc.")
-    if hints:
-        lines.append("Hints: " + " ".join(hints))
-    return "\n".join(lines)
-
-
-def _truncate_tool_payload(obj: Any, depth: int = 0) -> Any:
-    """Shrink tool JSON so LLM context stays bounded (drops tracebacks)."""
-    if depth > 12:
-        return "<truncated: max depth>"
-    if isinstance(obj, dict):
-        out: dict[str, Any] = {}
-        for k, v in obj.items():
-            if k == "traceback":
-                continue
-            out[k] = _truncate_tool_payload(v, depth + 1)
-        return out
-    if isinstance(obj, list):
-        if len(obj) > MAX_TOOL_LIST_ITEMS:
-            head = [_truncate_tool_payload(x, depth + 1) for x in obj[:MAX_TOOL_LIST_ITEMS]]
-            head.append({"_truncated_items": len(obj) - MAX_TOOL_LIST_ITEMS})
-            return head
-        return [_truncate_tool_payload(x, depth + 1) for x in obj]
-    if isinstance(obj, str):
-        if len(obj) > MAX_TOOL_STRING_CHARS:
-            return obj[: MAX_TOOL_STRING_CHARS - 3] + "..."
-        return obj
-    if isinstance(obj, (int, float, bool)) or obj is None:
-        return obj
-    try:
-        if hasattr(obj, "item"):
-            return obj.item()
-    except Exception:
-        pass
-    s = str(obj)
-    if len(s) > MAX_TOOL_STRING_CHARS:
-        return s[: MAX_TOOL_STRING_CHARS - 3] + "..."
-    return s
-
-
-def _tool_result_to_llm_json(tool_result: Any) -> str:
-    payload = _truncate_tool_payload(tool_result)
-    text = json.dumps(payload, ensure_ascii=False, default=str)
-    if len(text) <= MAX_TOOL_MESSAGE_JSON_CHARS:
-        return text
-    insight = ""
-    if isinstance(tool_result, dict):
-        insight = str(tool_result.get("insight", ""))
-    shrink = {
-        "truncated": True,
-        "original_json_chars": len(text),
-        "preview": text[: MAX_TOOL_MESSAGE_JSON_CHARS - 800],
-        "insight_preserved": insight[:2000],
-    }
-    return json.dumps(shrink, ensure_ascii=False, default=str)
-
-
-# ── Build system prompt ────────────────────────────────────────────────────────
+# ── System prompt ──────────────────────────────────────────────────────────────
 def _build_system_prompt(df: Optional[pd.DataFrame] = None, tool_names: Optional[list[str]] = None) -> str:
-    """Compact system prompt. Tool list passed separately to avoid repetition."""
     col_names = list(df.columns) if df is not None else []
     shape = f"{len(df):,}r×{len(df.columns)}c" if df is not None else "unknown"
-
     names_str = ", ".join(tool_names) if tool_names else "see tools"
-
     return (
         f"You are a data analyst. Dataset: {shape}, columns: {col_names}.\n"
         f"Available tools: {names_str}.\n"
@@ -213,38 +134,115 @@ def _build_system_prompt(df: Optional[pd.DataFrame] = None, tool_names: Optional
     )
 
 
-# ── Gọi Ollama chat API ────────────────────────────────────────────────────────
-def _call_ollama(
+# ── Payload helpers ────────────────────────────────────────────────────────────
+def _truncate_tool_payload(obj: Any, depth: int = 0) -> Any:
+    """Shrink tool JSON so LLM context stays bounded."""
+    if depth > 12:
+        return "<truncated: max depth>"
+    if isinstance(obj, dict):
+        return {k: _truncate_tool_payload(v, depth + 1) for k, v in obj.items() if k != "traceback"}
+    if isinstance(obj, list):
+        if len(obj) > MAX_TOOL_LIST_ITEMS:
+            head = [_truncate_tool_payload(x, depth + 1) for x in obj[:MAX_TOOL_LIST_ITEMS]]
+            head.append({"_truncated_items": len(obj) - MAX_TOOL_LIST_ITEMS})
+            return head
+        return [_truncate_tool_payload(x, depth + 1) for x in obj]
+    if isinstance(obj, str):
+        return obj[:MAX_TOOL_STRING_CHARS - 3] + "..." if len(obj) > MAX_TOOL_STRING_CHARS else obj
+    if isinstance(obj, (int, float, bool)) or obj is None:
+        return obj
+    try:
+        if hasattr(obj, "item"):
+            return obj.item()
+    except Exception:
+        pass
+    s = str(obj)
+    return s[:MAX_TOOL_STRING_CHARS - 3] + "..." if len(s) > MAX_TOOL_STRING_CHARS else s
+
+
+def _tool_result_to_llm_str(tool_result: Any) -> str:
+    payload = _truncate_tool_payload(tool_result)
+    text = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(text) <= MAX_TOOL_MESSAGE_JSON_CHARS:
+        return text
+    insight = str(tool_result.get("insight", "")) if isinstance(tool_result, dict) else ""
+    shrink = {
+        "truncated": True,
+        "original_json_chars": len(text),
+        "preview": text[:MAX_TOOL_MESSAGE_JSON_CHARS - 800],
+        "insight_preserved": insight[:2000],
+    }
+    return json.dumps(shrink, ensure_ascii=False, default=str)
+
+
+# ── LiteLLM call (provider-agnostic) ──────────────────────────────────────────
+def _call_llm(
     messages: List[dict],
-    tools: Optional[List[dict]],
-    ollama_base_url: str,
-    model: str,
+    tool_defs: Optional[List[dict]],
+    litellm_model: str,
+    api_base: Optional[str],
     temperature: float = 0.1,
     verbose: bool = False,
     timeout: int = TOOL_TIMEOUT_FIRST,
 ) -> dict:
-    url = f"{ollama_base_url.rstrip('/')}/api/chat"
-    payload: dict[str, Any] = {
-        "model": model,
+    """
+    Gọi LLM qua LiteLLM — hỗ trợ Ollama, Gemini, OpenAI và mọi provider LiteLLM.
+    Trả về dict chuẩn hoá: {"content": str, "tool_calls": list}.
+    """
+    kwargs: dict[str, Any] = {
+        "model": litellm_model,
         "messages": messages,
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": 1024},
+        "temperature": temperature,
+        "timeout": timeout,
     }
-    if tools:
-        payload["tools"] = tools
+    if api_base:
+        kwargs["api_base"] = api_base
+    if tool_defs:
+        kwargs["tools"] = tool_defs
+        kwargs["tool_choice"] = "auto"
 
     if verbose:
-        print(f"\n{Fore.LIGHTCYAN_EX}[ToolExecutor] POST {url} | tools={len(tools or [])} | timeout={timeout}s{Fore.RESET}")
+        print(
+            f"\n{Fore.LIGHTCYAN_EX}[ToolExecutor] LiteLLM call | model={litellm_model} "
+            f"| tools={len(tool_defs or [])} | timeout={timeout}s{Fore.RESET}"
+        )
 
-    resp = requests.post(url, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+    response = litellm.completion(**kwargs)
+    msg = response.choices[0].message
+
+    # Chuẩn hoá tool_calls về list[dict] bất kể provider
+    raw_tool_calls = getattr(msg, "tool_calls", None) or []
+    tool_calls = []
+    for tc in raw_tool_calls:
+        # LiteLLM trả về objects hoặc dict tuỳ provider
+        if isinstance(tc, dict):
+            tool_calls.append(tc)
+        else:
+            # OpenAI / Gemini / Ollama đều có .function.name + .function.arguments
+            func = getattr(tc, "function", None)
+            if func:
+                args = getattr(func, "arguments", "{}")
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+                tool_calls.append({
+                    "id": getattr(tc, "id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": getattr(func, "name", ""),
+                        "arguments": args,
+                    },
+                })
+
+    return {
+        "content": msg.content or "",
+        "tool_calls": tool_calls,
+    }
 
 
-# ── Parse và thực thi tool calls từ response ──────────────────────────────────
+# ── Thực thi tool calls ────────────────────────────────────────────────────────
 def _execute_tool_calls(tool_calls: list[dict], verbose: bool = False) -> list[dict]:
     """
-    Nhận list tool_calls từ Ollama response, thực thi từng tool,
+    Nhận list tool_calls đã chuẩn hoá, thực thi từng tool,
     trả về list message tool_result để gửi lại LLM.
     """
     results = []
@@ -253,7 +251,6 @@ def _execute_tool_calls(tool_calls: list[dict], verbose: bool = False) -> list[d
         tool_name = func_info.get("name", "")
         raw_args = func_info.get("arguments", {})
 
-        # Ollama có thể trả arguments dưới dạng string JSON
         if isinstance(raw_args, str):
             try:
                 args = json.loads(raw_args)
@@ -276,22 +273,23 @@ def _execute_tool_calls(tool_calls: list[dict], verbose: bool = False) -> list[d
             try:
                 tool_result = tool_fn(**args)
                 if verbose:
-                    insight = tool_result.get("insight", "")
-                    print(f"{Fore.LIGHTGREEN_EX}[ToolExecutor] Kết quả: {insight}{Fore.RESET}")
+                    print(f"{Fore.LIGHTGREEN_EX}[ToolExecutor] Kết quả: {tool_result.get('insight', '')}{Fore.RESET}")
             except Exception as e:
-                tb = traceback.format_exc()
                 if verbose:
-                    print(f"{Fore.LIGHTRED_EX}[ToolExecutor] Traceback:\n{tb}{Fore.RESET}")
-                tool_result = {
-                    "error": f"Lỗi khi thực thi tool '{tool_name}': {str(e)}",
-                }
+                    print(f"{Fore.LIGHTRED_EX}[ToolExecutor] Traceback:\n{traceback.format_exc()}{Fore.RESET}")
+                tool_result = {"error": f"Lỗi khi thực thi tool '{tool_name}': {str(e)}"}
                 print(f"{Fore.LIGHTRED_EX}[ToolExecutor] Lỗi tool: {e}{Fore.RESET}")
 
-        # Chuẩn format Ollama tool result message
-        results.append({
+        # tool_call_id bắt buộc cho OpenAI; Ollama/Gemini bỏ qua nếu rỗng
+        tool_msg: dict[str, Any] = {
             "role": "tool",
-            "content": _tool_result_to_llm_json(tool_result),
-        })
+            "content": _tool_result_to_llm_str(tool_result),
+        }
+        call_id = tc.get("id", "")
+        if call_id:
+            tool_msg["tool_call_id"] = call_id
+
+        results.append(tool_msg)
 
     return results
 
@@ -303,25 +301,31 @@ def _execute_tool_calls(tool_calls: list[dict], verbose: bool = False) -> list[d
 def run_tool_insight(
     user_question: str,
     df: pd.DataFrame,
-    ollama_base_url: str = "http://localhost:11434",
-    model: str = "qwen2.5:7b",
+    litellm_model: str = "ollama/qwen2.5:7b",
+    api_base: Optional[str] = "http://localhost:11434",
+    temperature: float = 0.1,
     verbose: bool = False,
 ) -> str:
     """
-    Run tool-calling rounds and return a natural-language insight for the user.
+    Chạy vòng lặp tool-calling và trả về insight ngôn ngữ tự nhiên tiếng Việt.
 
-    The UI is Vietnamese-only: the returned text must be Vietnamese even though
-    prompts to the model are written in English.
+    Args:
+        user_question : Câu hỏi của người dùng.
+        df            : DataFrame đang phân tích.
+        litellm_model : Tên model theo định dạng LiteLLM
+                        (vd: "ollama/qwen2.5:7b", "gemini/gemini-2.0-flash", "gpt-4o-mini").
+        api_base      : Base URL cho Ollama local; None với Gemini/OpenAI.
+        temperature   : Nhiệt độ sinh text.
+        verbose       : In log chi tiết.
     """
-    # ── Inject df vào tất cả tool modules ────────────────────────────────────
     _inject_dataframe(df)
 
-    # ── Route: chọn tools phù hợp với câu hỏi (tối đa _MAX_TOOLS_PER_REQUEST) ──
     tool_defs = _route_tools(user_question)
     tool_names_selected = [t["function"]["name"] for t in tool_defs if "function" in t]
 
     print(
-        f"{Fore.LIGHTCYAN_EX}[ToolExecutor] Routed {len(tool_defs)}/{len(get_tool_definitions())} tools: "
+        f"{Fore.LIGHTCYAN_EX}[ToolExecutor] model={litellm_model} | "
+        f"Routed {len(tool_defs)}/{len(get_tool_definitions())} tools: "
         f"{tool_names_selected}{Fore.RESET}"
     )
 
@@ -330,51 +334,47 @@ def run_tool_insight(
 
     messages: list[dict] = [
         {"role": "system", "content": _build_system_prompt(df, tool_names_selected)},
-        {
-            "role": "user",
-            "content": f"{user_question}\n\nAnswer in Vietnamese only.",
-        },
+        {"role": "user", "content": f"{user_question}\n\nAnswer in Vietnamese only."},
     ]
 
-    # ── Vòng lặp tool-calling (multi-round) ──────────────────────────────────
     for round_idx in range(MAX_TOOL_ROUNDS):
         if verbose:
             print(f"\n{Fore.LIGHTBLUE_EX}[ToolExecutor] Round {round_idx + 1}/{MAX_TOOL_ROUNDS}{Fore.RESET}")
 
+        timeout = TOOL_TIMEOUT_FIRST if round_idx == 0 else TOOL_TIMEOUT_RETRY
+
         try:
-            timeout = TOOL_TIMEOUT_FIRST if round_idx == 0 else TOOL_TIMEOUT_RETRY
-            response = _call_ollama(
+            result = _call_llm(
                 messages=messages,
-                tools=tool_defs,
-                ollama_base_url=ollama_base_url,
-                model=model,
+                tool_defs=tool_defs,
+                litellm_model=litellm_model,
+                api_base=api_base,
+                temperature=temperature,
                 verbose=verbose,
                 timeout=timeout,
             )
-        except requests.exceptions.ConnectionError:
-            return f"⚠️ Không thể kết nối Ollama tại '{ollama_base_url}'."
-        except requests.exceptions.Timeout:
-            return f"⚠️ Timeout khi chờ LLM phản hồi (>{TOOL_TIMEOUT}s)."
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response else "?"
-            try:
-                body = e.response.json().get("error", "")
-            except Exception:
-                body = ""
-            return f"⚠️ Ollama HTTP {status}: {body}"
+        except litellm.exceptions.APIConnectionError:
+            return f"⚠️ Không thể kết nối tới provider (model={litellm_model})."
+        except litellm.exceptions.Timeout:
+            return f"⚠️ Timeout khi chờ LLM phản hồi (>{timeout}s)."
+        except litellm.exceptions.AuthenticationError:
+            return "⚠️ API key không hợp lệ hoặc chưa được thiết lập."
+        except litellm.exceptions.BadRequestError as e:
+            return f"⚠️ Model không hỗ trợ tool-calling hoặc request lỗi: {e}"
         except Exception as e:
             return f"⚠️ Lỗi không xác định: {e}"
 
-        msg = response.get("message", {})
-        assistant_content = msg.get("content", "")
-        tool_calls = msg.get("tool_calls", [])
+        assistant_content = result["content"]
+        tool_calls = result["tool_calls"]
 
-        # Thêm assistant message vào history
-        messages.append({
+        # Thêm assistant message (kèm tool_calls nếu có để OpenAI không lỗi)
+        assistant_msg: dict[str, Any] = {
             "role": "assistant",
             "content": assistant_content,
-            **({"tool_calls": tool_calls} if tool_calls else {}),
-        })
+        }
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
 
         if verbose:
             print(
@@ -382,16 +382,15 @@ def run_tool_insight(
                 f"| content_len={len(assistant_content)}{Fore.RESET}"
             )
 
-        # Nếu không có tool call → LLM đã trả lời xong
+        # Không có tool call → LLM đã trả lời xong
         if not tool_calls:
             final_text = assistant_content.strip()
             return final_text if final_text else "⚠️ LLM không trả về nội dung."
 
-        # Thực thi tool calls → thêm kết quả vào messages
+        # Thực thi tool calls → gửi kết quả lại LLM
         tool_result_messages = _execute_tool_calls(tool_calls, verbose=verbose)
         messages.extend(tool_result_messages)
 
-    # Nếu hết round vẫn còn tool calls → lấy content cuối cùng
     last_content = messages[-1].get("content", "").strip() if messages else ""
     return (
         last_content
